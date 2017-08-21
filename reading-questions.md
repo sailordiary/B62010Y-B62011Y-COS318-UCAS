@@ -1,5 +1,5 @@
 # 预习思考题
-翻译自：[COS 318](http://www.cs.princeton.edu/courses/archive/fall08/cos318/reading/questions.html)
+翻译自[COS 318: Reading Questions](http://www.cs.princeton.edu/courses/archive/fall08/cos318/reading/questions.html)
 ## MOS 1.4-1.5
 *目标*：理解操作系统的职能、组成和提供的服务。
 - BIOS通常存储在闪存中。是否有可能将BIOS存储在磁盘上？请简要概述在闪存和磁盘上存储BIOS的利弊。

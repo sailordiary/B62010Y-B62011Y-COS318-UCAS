@@ -20,6 +20,8 @@
 #define DISK_ROOT "/home/yuan-hang/Dev/os/project6-start-code/disk.img"
 
 #define MAX_DIRECT_NUM 12
+#define DIRECT_BLOCK_BYTES (MAX_DIRECT_NUM * sizeof(int))
+#define MAX_INDIRECT_NUM (BLOCK_SIZE / sizeof(int))
 #define MAX_FILENAME_LEN 256
 #define MAX_PATH_LEN 4096
 #define MAX_OPEN_FILE 65536
@@ -32,6 +34,7 @@
 #define TOTAL_BLOCKS (PARTITION_SIZE / BLOCK_SIZE)
 // NOTE: 1 block should be enough for any directory inode
 #define MAX_DENTRY (BLOCK_SIZE / sizeof(struct dentry))
+#define MAX_FILE_SIZE (DIRECT_BLOCK_BYTES + MAX_INDIRECT_NUM * BLOCK_SIZE)
 
 #define BLOCK_MAP_NARRAY (TOTAL_BLOCKS / sizeof(unsigned long long) + 1)
 #define INODE_MAP_NARRAY (MAX_INODE / sizeof(unsigned long long) + 1)

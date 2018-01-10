@@ -1,11 +1,14 @@
 #include "common.h"
 
-// ISSUES
-// 01/10: did not check for too many files
-// when creating new dentry;
-// did not check if a file is busy
+// KNOWN ISSUES
+// 01/10: did not check for too many files in directory
+// when creating new dentry; to fix this, check has_* attributes
+// before actually doing disk I/O.
+// There's also a potential risk of modifying inodes without
+// doing data block allocation due to lack of space.
+// Also, did not check if a file is busy.
 
-/*define global variables here*/
+/* define global variables here */
 struct superblock fs_superblock;
 struct superblock_t sblk;
 struct inode inode_table[MAX_INODE];
@@ -265,7 +268,7 @@ int dentry_from_path(const char *path)
     strcpy(path_cp, path);
     char *last = strrchr(path_cp, '/');
     *last = '\0';
-    
+
     return inode_from_path(path_cp);
 }
 
@@ -273,39 +276,73 @@ int dentry_from_path(const char *path)
 void read_blocks(struct inode_t *ino, char *buf)
 {
     int file_sz = ino->size, blocks = file_sz / BLOCK_SIZE;
-    int n_direct, n_indirect;
-    if (blocks > MAX_DIRECT_NUM)
+    int n_indirect = blocks - MAX_DIRECT_NUM;
+
+    // copy direct blocks
+    memcpy(buf, ino->block, file_sz);
+    // copy indirect blocks
+    if (n_indirect > 0)
     {
-        n_direct = MAX_DIRECT_NUM;
-        n_indirect = file_sz / BLOCK_SIZE - MAX_DIRECT_NUM;
+        unsigned char tbuf[SECTOR_SIZE];
+        unsigned char dbuf[SECTOR_SIZE];
+
+        char *dst = buf + DIRECT_BLOCK_BYTES;
+        int nremaining = file_sz - DIRECT_BLOCK_BYTES, len;
+        int i, *p = (int *)tbuf;
+
+        device_read_sector(tbuf, ino->indirect_table);
+        for (i = 0; i < n_indirect; ++i)
+        {
+            len = (nremaining > BLOCK_SIZE) ? BLOCK_SIZE : nremaining;
+            device_read_sector(dbuf, p[i]);
+            memcpy(dst + i * BLOCK_SIZE, dbuf, len);
+            nremaining -= len;
+        }
     }
-    else
-    {
-        n_direct = file_sz / BLOCK_SIZE;
-        n_indirect = 0;
-    }
-    int i;
-    // check for reading beyond
-    for (i = 0; i < n_direct; ++i)
-    {
-    }
-    for (i = 0; i < n_indirect; ++i)
-    {
-    }
+    return;
 }
 
-void write_blocks(struct inode_t *ino, char *buf) {
+// precondition: enough space allocated
+void write_blocks(struct inode_t *ino, char *buf)
+{
 
 }
 
+// precondition: ino->size > new_size
 void recycle_blocks(struct inode_t *ino, int new_size)
 {
+    // recycle rear indirect blocks
+    // blocks need not be zeroed, modify the bitmap only
+    int diff = ino->size - new_size;
+    diff /= BLOCK_SIZE;
+    if (ino->size <= DIRECT_BLOCK_BYTES || diff == 0)
+        return;
+    else {
+        unsigned char tbuf[SECTOR_SIZE];
+        int bytes, *p = (int *)tbuf, blocks = ino->size / BLOCK_SIZE;
+        if (ino->size % BLOCK_SIZE != 0)
+            blocks++;
+        int i = new_size / BLOCK_SIZE + 1;
+        if (new_size % BLOCK_SIZE != 0)
+            i++;
+        pthread_mutex_lock(&block_bitmap_lock);
+        for (; i < blocks; ++i)
+            set_bitmap(block_bitmap, p[i], BLOCK_BITMAP_SECTOR_NUM);
+        pthread_mutex_unlock(&block_bitmap_lock);
+    }
+    return;
 }
 
 // allocate space for ino so that it has at least new_size bytes
 int alloc_blocks(struct inode_t *ino, int new_size)
 {
-
+    if (new_size <= DIRECT_BLOCK_BYTES)
+        return;
+    else {
+        
+    }
+    // return -EFBIG;
+    // return -ENOSPC;
 }
 
 // FUSE operation implementations
@@ -831,8 +868,9 @@ int p6fs_write(const char *path, const char *buf, size_t size, off_t offset, str
         offset = inode->size;
     int new_size = offset + size, ret;
     if (new_size > inode->size)
-        if (ret = alloc_blocks(inode, new_size) == -1)
-            return -ENOSPC;
+        if (ret = alloc_blocks(inode, new_size) < 0)
+            // either file is too large or device has no free space
+            return ret;
     write_blocks(inode, buf);
     fi->inode_num = inode_num;
 

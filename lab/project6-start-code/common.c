@@ -261,21 +261,12 @@ int inode_from_path(const char *path)
 // returns -1 if not found
 int dentry_from_path(const char *path)
 {
-    if (strcmp(path, "/"))
-        return -1;
-    char path_cp[MAX_PATH_LEN];
+    char path_cp[MAX_FILENAME_LEN];
     strcpy(path_cp, path);
-    unsigned char buf[SECTOR_SIZE];
-    // read root dentry
-    device_read_sector(buf, DATABLOCK_SECTOR_NUM);
-    memcpy(&root, buf, sizeof(struct dentry));
-
-    char *p = strtok(path_cp, '/');
-    while (p)
-    {
-    }
-
-    return -1;
+    char *last = strrchr(path_cp, '/');
+    *last = '\0';
+    
+    return inode_from_path(path_cp);
 }
 
 // data block access

@@ -12,7 +12,7 @@
 struct superblock fs_superblock;
 struct superblock_t sblk;
 struct inode inode_table[MAX_INODE];
-struct inode_t ino[MAX_INODE];
+struct inode_t inode_info[MAX_INODE];
 
 struct dentry root;
 struct file_info fd_table[MAX_OPEN_FILE];
@@ -46,9 +46,9 @@ void clear_bitmap(unsigned long long *bitmap, int i, int offset)
     device_flush();
 }
 
-void flush_inode(int i)
+void flush_inode(struct inode_t *inode)
 {
-    device_write_sector((unsigned char *)(inode_table[i].inode), SECTOR_SIZE);
+    device_write_sector((unsigned char *)inode, SECTOR_SIZE);
     device_flush();
 }
 
@@ -56,11 +56,11 @@ void flush_inode(int i)
 void mount(struct superblock_t *sblock)
 {
     // initialize in-memory structure
-    if (!(pthread_mutex_init(&fs_superblock.lock, NULL) ||
+    if ((pthread_mutex_init(&fs_superblock.lock, NULL) ||
           pthread_mutex_init(&block_bitmap_lock, NULL) ||
           pthread_mutex_init(&inode_bitmap_lock, NULL)))
     {
-        printf("Lock initialization failed\n");
+        printf("Block and bitmap lock initialization failed\n");
         exit(-1);
     }
     fs_superblock.sb = &sblk;
@@ -68,10 +68,10 @@ void mount(struct superblock_t *sblock)
     int i;
     for (i = 0; i < MAX_INODE; ++i)
     {
-        inode_table[i].inode = &ino[i];
-        if (!(pthread_mutex_init(&(inode_table[i].lock), NULL)))
+        inode_table[i].inode = &inode_info[i];
+        if (pthread_mutex_init(&(inode_table[i].lock), NULL))
         {
-            printf("Lock initialization failed\n");
+            printf("Inode table lock initialization failed\n");
             exit(-1);
         }
     }
@@ -161,7 +161,6 @@ void mkfs()
         {.filename = ".", .inode_num = 0},
         {.filename = "..", .inode_num = 0},
     };
-    unsigned char buf[SECTOR_SIZE];
     // NOTE: workaround; invalidate the rest of the sector
     memset(buf, -1, sizeof(buf));
     memcpy(buf, root_entries, sizeof(struct dentry) * 2);
@@ -224,7 +223,7 @@ int inode_from_path(const char *path)
     struct inode_t *inode;
 
     strcpy(path_cp, path);
-    char *p = strtok(path_cp, '/');
+    p = strtok(path_cp, '/');
     while (p)
     {
         // TODO: EACCES permission check
@@ -273,39 +272,66 @@ int dentry_from_path(const char *path)
 }
 
 // data block access
-void read_blocks(struct inode_t *ino, char *buf)
+void read_blocks(struct inode_t *ino, char *buf, off_t offset, size_t size)
 {
-    int file_sz = ino->size, blocks = file_sz / BLOCK_SIZE;
-    int n_indirect = blocks - MAX_DIRECT_NUM;
-
-    // copy direct blocks
-    memcpy(buf, ino->block, file_sz);
+    int direct_sz = DIRECT_BLOCK_BYTES - offset;
+    if (direct_sz >= 0)
+        // copy direct blocks
+        memcpy(buf, ino->block + offset, direct_sz);
+    if (offset + size <= DIRECT_BLOCK_BYTES)
+        return;
     // copy indirect blocks
-    if (n_indirect > 0)
+    int indirect_sz = size - direct_sz;
+    int n_indirect = indirect_sz / BLOCK_SIZE;
+    if (indirect_sz % BLOCK_SIZE)
+        n_indirect++;
+    unsigned char tbuf[SECTOR_SIZE];
+    unsigned char dbuf[SECTOR_SIZE];
+
+    char *dst = buf + direct_sz, len;
+    int i, *p = (int *)tbuf;
+
+    device_read_sector(tbuf, ino->indirect_table);
+    for (i = 0; i < n_indirect; ++i)
     {
-        unsigned char tbuf[SECTOR_SIZE];
-        unsigned char dbuf[SECTOR_SIZE];
-
-        char *dst = buf + DIRECT_BLOCK_BYTES;
-        int nremaining = file_sz - DIRECT_BLOCK_BYTES, len;
-        int i, *p = (int *)tbuf;
-
-        device_read_sector(tbuf, ino->indirect_table);
-        for (i = 0; i < n_indirect; ++i)
-        {
-            len = (nremaining > BLOCK_SIZE) ? BLOCK_SIZE : nremaining;
-            device_read_sector(dbuf, p[i]);
-            memcpy(dst + i * BLOCK_SIZE, dbuf, len);
-            nremaining -= len;
-        }
+        len = (indirect_sz > BLOCK_SIZE) ? BLOCK_SIZE : indirect_sz;
+        device_read_sector(dbuf, p[i]);
+        memcpy(dst + i * BLOCK_SIZE, dbuf, len);
+        indirect_sz -= len;
     }
     return;
 }
 
 // precondition: enough space allocated
-void write_blocks(struct inode_t *ino, char *buf)
+void write_blocks(struct inode_t *ino, char *buf, off_t offset, size_t size)
 {
+    int direct_sz = DIRECT_BLOCK_BYTES - offset;
+    if (direct_sz >= 0)
+        // copy direct blocks
+        memcpy(ino->block + offset, buf, direct_sz);
+    if (offset + size <= DIRECT_BLOCK_BYTES)
+        return;
+    // copy indirect blocks
+    unsigned char tbuf[SECTOR_SIZE];
+    unsigned char dbuf[SECTOR_SIZE];
 
+    int indirect_sz = size - direct_sz, len;
+    int n_indirect = indirect_sz / BLOCK_SIZE;
+    if (indirect_sz % BLOCK_SIZE)
+        ++n_indirect;
+    char *src = buf + direct_sz;
+    int i, *p = (int *)tbuf;
+
+    device_read_sector(tbuf, ino->indirect_table);
+    for (i = 0; i < n_indirect; ++i)
+    {
+        len = (indirect_sz > BLOCK_SIZE) ? BLOCK_SIZE : indirect_sz;
+        memcpy(dbuf, src + i * BLOCK_SIZE, len);
+        device_write_sector(dbuf, p[i]);
+        device_flush();
+        indirect_sz -= len;
+    }
+    return;
 }
 
 // precondition: ino->size > new_size
@@ -317,9 +343,10 @@ void recycle_blocks(struct inode_t *ino, int new_size)
     diff /= BLOCK_SIZE;
     if (ino->size <= DIRECT_BLOCK_BYTES || diff == 0)
         return;
-    else {
+    else
+    {
         unsigned char tbuf[SECTOR_SIZE];
-        int bytes, *p = (int *)tbuf, blocks = ino->size / BLOCK_SIZE;
+        int *p = (int *)tbuf, blocks = ino->size / BLOCK_SIZE;
         if (ino->size % BLOCK_SIZE != 0)
             blocks++;
         int i = new_size / BLOCK_SIZE + 1;
@@ -336,13 +363,55 @@ void recycle_blocks(struct inode_t *ino, int new_size)
 // allocate space for ino so that it has at least new_size bytes
 int alloc_blocks(struct inode_t *ino, int new_size)
 {
+    if (new_size > MAX_FILE_SIZE)
+        return -EFBIG;
     if (new_size <= DIRECT_BLOCK_BYTES)
         return;
-    else {
-        
+    else
+    {
+        int nremaining = new_size - DIRECT_BLOCK_BYTES;
+        int blocks = nremaining / BLOCK_SIZE;
+        if (nremaining % BLOCK_SIZE)
+            ++blocks;
+        int i, nalloc = 0;
+        pthread_mutex_lock(&block_bitmap_lock);
+        // allocate indirect block table
+        if (ino->indirect_table == -1)
+        {
+            for (i = 0; i < TOTAL_BLOCKS; ++i)
+            {
+                if (test_bit(block_bitmap, i))
+                {
+                    set_bitmap(block_bitmap, i, BLOCK_BITMAP_SECTOR_NUM);
+                    ino->indirect_table = i;
+                    flush_inode(ino);
+                }
+            }
+        }
+        // allocate datablocks
+        int table[MAX_INDIRECT_NUM];
+        for (i = 0; i < blocks; ++i)
+        {
+            // if there aren't enough, cancel selection
+            if (!test_bit(block_bitmap, i))
+            {
+                table[nalloc] = i;
+                ++nalloc;
+            }
+            if (nalloc < blocks)
+            {
+                pthread_mutex_unlock(&block_bitmap_lock);
+                return -ENOSPC;
+            }
+            else
+            {
+                for (i = 0; i < blocks; ++i)
+                    set_bitmap(block_bitmap, table[i], BLOCK_BITMAP_SECTOR_NUM);
+                pthread_mutex_unlock(&block_bitmap_lock);
+                return 0;
+            }
+        }
     }
-    // return -EFBIG;
-    // return -ENOSPC;
 }
 
 // FUSE operation implementations
@@ -406,7 +475,7 @@ int p6fs_mkdir(const char *path, mode_t mode)
                 return -ENOSPC;
             inode->block[0] = DATABLOCK_SECTOR_NUM + j;
             inode->indirect_table = -1;
-            flush_inode(i);
+            flush_inode(inode);
             pthread_mutex_unlock(&inode_table[i].lock);
 
             break;
@@ -470,8 +539,8 @@ int p6fs_rmdir(const char *path)
         {
             dp->inode_num = -1;
             pthread_mutex_lock(&(inode_table[inode_num].lock));
-            memset(inode_table[inode_num].inode, 0, sizeof(struct inode_t));
-            flush_inode(inode_num);
+            memset(inode, 0, sizeof(struct inode_t));
+            flush_inode(inode);
             pthread_mutex_lock(&inode_bitmap_lock);
             clear_bitmap(inode_bitmap, inode_num, INODE_BITMAP_SECTOR_NUM);
             pthread_mutex_unlock(&inode_bitmap_lock);
@@ -498,11 +567,11 @@ int p6fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offs
         return inode_num;
 
     struct inode_t *inode = inode_table[inode_num].inode;
-    unsigned char buf[SECTOR_SIZE];
-    device_read_sector(buf, inode->block[0]);
+    unsigned char dbuf[SECTOR_SIZE];
+    device_read_sector(dbuf, inode->block[0]);
 
     int i, ret;
-    char *p = buf;
+    char *p = dbuf;
     struct dentry *dp = (struct dentry *)p;
     for (i = 0; i < MAX_DENTRY; ++i, dp += sizeof(struct dentry))
     {
@@ -566,7 +635,7 @@ int p6fs_mknod(const char *path, mode_t mode, dev_t dev)
                 return -ENOSPC;
             inode->block[0] = DATABLOCK_SECTOR_NUM + j;
             inode->indirect_table = -1;
-            flush_inode(i);
+            flush_inode(inode);
             pthread_mutex_unlock(&inode_table[i].lock);
 
             break;
@@ -608,6 +677,9 @@ int p6fs_readlink(const char *path, char *link, size_t size)
     unsigned char buf[SECTOR_SIZE];
     memset(buf, 0, sizeof(buf));
     device_read_sector(buf, inode->block[0]);
+    strcpy(link, buf);
+
+    return 0;
 }
 
 // Create a symbolic link named "link" which, when evaluated, will lead to "path".
@@ -657,7 +729,7 @@ int p6fs_symlink(const char *path, const char *link)
                 return -ENOSPC;
             inode->block[0] = DATABLOCK_SECTOR_NUM + j;
             inode->indirect_table = -1;
-            flush_inode(i);
+            flush_inode(inode);
             pthread_mutex_unlock(&inode_table[i].lock);
 
             device_write_sector(buf, inode->block[0]);
@@ -758,14 +830,14 @@ int p6fs_unlink(const char *path)
     if (inode->type == ISLNK)
     {
         inode->link_count--;
-        flush_inode(inode_num);
+        flush_inode(inode);
     }
     // removing a symlink or regular file
     else
     {
         pthread_mutex_lock(&(inode_table[inode_num].lock));
         memset(inode, 0, sizeof(struct inode_t));
-        flush_inode(inode_num);
+        flush_inode(inode);
         pthread_mutex_lock(&inode_bitmap_lock);
         clear_bitmap(inode_bitmap, inode_num, INODE_BITMAP_SECTOR_NUM);
         pthread_mutex_unlock(&inode_bitmap_lock);
@@ -848,8 +920,8 @@ int p6fs_read(const char *path, char *buf, size_t size, off_t offset, struct fus
         return 0;
 
     // access direct and indirect blocks
-    read_blocks(inode, buf);
-    return inode->size;
+    read_blocks(inode, buf, offset, size);
+    return size;
 }
 
 // Returns the number of bytes transferred.
@@ -871,7 +943,7 @@ int p6fs_write(const char *path, const char *buf, size_t size, off_t offset, str
         if (ret = alloc_blocks(inode, new_size) < 0)
             // either file is too large or device has no free space
             return ret;
-    write_blocks(inode, buf);
+    write_blocks(inode, buf, offset, size);
     fi->inode_num = inode_num;
 
     return size;
@@ -895,7 +967,7 @@ int p6fs_truncate(const char *path, off_t newSize)
             return -ENOSPC;
     }
     inode->size = newSize;
-    flush_inode(inode_num);
+    flush_inode(inode);
 
     return 0;
 }
@@ -956,7 +1028,8 @@ int p6fs_utime(const char *path, struct utimbuf *ubuf)
     struct inode_t *inode = inode_table[inode_num].inode;
     struct fuse_context *fuse_con = fuse_get_context();
     uid_t current_uid = fuse_con->uid;
-    if (current_uid == inode->uid ||)
+    // TODO: check permission
+    if (current_uid == inode->uid || 1)
     {
         if (ubuf == NULL)
         {
@@ -989,7 +1062,7 @@ int p6fs_chmod(const char *path, mode_t mode)
     pthread_mutex_lock(&inode_table[inode_num].lock);
     struct inode_t *inode = inode_table[inode_num].inode;
     inode->mode = mode;
-    flush_inode(inode_num);
+    flush_inode(inode);
     pthread_mutex_unlock(&inode_table[inode_num].lock);
 
     return 0;
@@ -1023,7 +1096,7 @@ int p6fs_chown(const char *path, uid_t uid, gid_t gid)
         inode->uid = uid;
         inode->gid = gid;
         inode->ctime = time(NULL);
-        flush_inode(inode_num);
+        flush_inode(inode);
     }
 
     return 0;
@@ -1106,14 +1179,16 @@ void *p6fs_init(struct fuse_conn_info *conn)
         printf("DISK: Failed to open disk\n");
         exit(-1);
     }
-
     device_read_sector(buf, SUPERBLOCK_SECTOR_NUM);
     memcpy(&sblock_buf, buf, sizeof(struct superblock_t));
 
     // check if there is an existing filesystem
     int exist = 0;
-    if (sblock_buf.magic_number == P6FS_MAGIC)
+    if (sblock_buf.magic_number == P6FS_MAGIC) {
         exist = 1;
+        DEBUG("Found P6FS filesystem on disk %s\n", DISK_ROOT)
+        DEBUG("Using original superblock\n")
+    }
     else
     {
         device_read_sector(buf, SUPERBLOCK_BK_SECTOR_NUM);
@@ -1121,6 +1196,8 @@ void *p6fs_init(struct fuse_conn_info *conn)
         if (sblock_buf.magic_number == P6FS_MAGIC)
         {
             exist = 1;
+            DEBUG("Found P6FS filesystem on disk %s\n", DISK_ROOT)
+            DEBUG("Using backup superblock\n")
             // CHKDSK: fix superblock
             device_write_sector(buf, SUPERBLOCK_SECTOR_NUM);
             device_flush();
@@ -1129,8 +1206,10 @@ void *p6fs_init(struct fuse_conn_info *conn)
 
     if (exist)
         mount(&sblock_buf);
-    else
+    else {
+        DEBUG("Creating filesystem on %s\n", DISK_ROOT)
         mkfs();
+    }
 
     /* the fuse_context is a global variable, you can use it in
      all file operation, and you could also get uid, gid and pid

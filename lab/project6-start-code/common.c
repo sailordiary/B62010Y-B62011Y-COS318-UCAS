@@ -1169,7 +1169,7 @@ void *p6fs_init(struct fuse_conn_info *conn)
 
     if (device_open(DISK_ROOT) == -1)
     {
-        printf("Failed to open disk\n");
+        ERR("Failed to open disk")
         exit(-1);
     }
     device_read_sector(buf, SUPERBLOCK_SECTOR_NUM);
@@ -1180,8 +1180,8 @@ void *p6fs_init(struct fuse_conn_info *conn)
     if (sblock_buf.magic_number == P6FS_MAGIC)
     {
         exist = 1;
-        //DEBUG("Found P6FS filesystem on disk %s\n", DISK_ROOT)
-        //DEBUG("Using original superblock\n")
+        INFO("Found P6FS filesystem on disk %s", DISK_ROOT)
+        INFO("Using original superblock")
     }
     else
     {
@@ -1190,8 +1190,8 @@ void *p6fs_init(struct fuse_conn_info *conn)
         if (sblock_buf.magic_number == P6FS_MAGIC)
         {
             exist = 1;
-            //DEBUG("Found P6FS filesystem on disk %s\n", DISK_ROOT)
-            //DEBUG("Using backup superblock\n")
+            INFO("Found P6FS filesystem on disk %s", DISK_ROOT)
+            INFO("Using backup superblock")
             // CHKDSK: fix superblock
             device_write_sector(buf, SUPERBLOCK_SECTOR_NUM);
             device_flush();

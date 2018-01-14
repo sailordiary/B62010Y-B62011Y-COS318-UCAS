@@ -34,21 +34,27 @@ pthread_mutex_t block_bitmap_lock, inode_bitmap_lock;
 // maintain consistency between disk and memory
 void set_bitmap(unsigned long long *bitmap, int i, int offset)
 {
+    unsigned char buf[SECTOR_SIZE];
     set_bit(bitmap, i);
-    device_write_sector((unsigned char *)(bitmap + i / sizeof(unsigned long long)), offset + i / SECTOR_SIZE);
+    memcpy(buf, bitmap + i / sizeof(unsigned long long), SECTOR_SIZE);
+    device_write_sector(buf, offset + i / SECTOR_SIZE);
     device_flush();
 }
 
 void clear_bitmap(unsigned long long *bitmap, int i, int offset)
 {
+    unsigned char buf[SECTOR_SIZE];
     clear_bit(bitmap, i);
-    device_write_sector((unsigned char *)(bitmap + i / sizeof(unsigned long long)), offset + i / SECTOR_SIZE);
+    memcpy(buf, bitmap + i / sizeof(unsigned long long), SECTOR_SIZE);
+    device_write_sector(buf, offset + i / SECTOR_SIZE);
     device_flush();
 }
 
 void flush_inode(struct inode_t *inode)
 {
-    device_write_sector((unsigned char *)inode, SECTOR_SIZE);
+    unsigned char buf[SECTOR_SIZE] = {0};
+    memcpy(buf, inode, sizeof(struct inode_t));
+    device_write_sector(buf, inode->sector);
     device_flush();
 }
 
@@ -108,6 +114,7 @@ void mountfs(struct superblock_t *sblock)
 void mkfs()
 {
     struct superblock_t sblock;
+    unsigned char buf[SECTOR_SIZE] = {0};
 
     // create superblock
     sblock.magic_number = P6FS_MAGIC;
@@ -121,8 +128,9 @@ void mkfs()
     sblock.inode_table = SECTOR_SIZE * INODE_TABLE_SECTOR_NUM;
     sblock.inode_map = SECTOR_SIZE * INODE_BITMAP_SECTOR_NUM;
     // write new superblock to device
-    device_write_sector((unsigned char *)&sblock, SUPERBLOCK_SECTOR_NUM);
-    device_write_sector((unsigned char *)&sblock, SUPERBLOCK_BK_SECTOR_NUM);
+    memcpy(buf, &sblock, sizeof(struct superblock_t));
+    device_write_sector(buf, SUPERBLOCK_SECTOR_NUM);
+    device_write_sector(buf, SUPERBLOCK_BK_SECTOR_NUM);
     device_flush();
 
     // create inode entries and bitmaps
@@ -131,7 +139,24 @@ void mkfs()
     uid_t uid = fuse_con->uid;
     gid_t gid = fuse_con->gid;
 
-    struct inode_t root_inode = {.size = BLOCK_SIZE, .type = ISDIR,
+    struct inode_t empty_inode = {.sector = 0, .size = 0, .type = ISREG,
+                                  //.mode = ...,
+                                  .uid = uid,
+                                  .gid = gid,
+                                  .link_count = 0,
+                                  .block[0] = -1,
+                                  .indirect_table = -1,
+                                  .ctime = 0,
+                                  .atime = 0,
+                                  .mtime = 0};
+    int i;
+    for (i = 0; i < MAX_INODE; ++i)
+    {
+        empty_inode.sector = i + INODE_TABLE_SECTOR_NUM;
+        flush_inode(&empty_inode);
+    }
+
+    struct inode_t root_inode = {.sector = INODE_TABLE_SECTOR_NUM, .size = BLOCK_SIZE, .type = ISDIR,
                                  //.mode = ...,
                                  .uid = uid,
                                  .gid = gid,
@@ -141,17 +166,10 @@ void mkfs()
                                  .ctime = time(NULL),
                                  .atime = time(NULL),
                                  .mtime = time(NULL)};
-    device_write_sector((unsigned char *)&root_inode, INODE_TABLE_SECTOR_NUM);
-    device_flush();
+    flush_inode(&root_inode);
 
-    unsigned char buf[SECTOR_SIZE] = {0};
-    int i;
-    for (i = BLOCK_BITMAP_SECTOR_NUM; i < INODE_TABLE_SECTOR_NUM; ++i)
-    {
-        device_write_sector(buf, i);
-        device_flush();
-    }
-
+    // clear entire bitmap but the first bit
+    memset(buf, 0, sizeof(buf));
     buf[0] = 0x1 << 7;
     device_write_sector(buf, INODE_BITMAP_SECTOR_NUM);
     device_write_sector(buf, BLOCK_BITMAP_SECTOR_NUM);
@@ -244,7 +262,7 @@ int inode_from_path(const char *path)
         {
             // read link path from block
             device_read_sector(buf, inode->block[0]);
-            inode_num = inode_from_path((char *) buf);
+            inode_num = inode_from_path((char *)buf);
             if (inode_num < 0)
                 return inode_num;
         }
@@ -323,7 +341,7 @@ void write_blocks(struct inode_t *ino, const char *buf, off_t offset, size_t siz
     int n_indirect = indirect_sz / BLOCK_SIZE;
     if (indirect_sz % BLOCK_SIZE)
         ++n_indirect;
-    char *src = buf + direct_sz;
+    const char *src = buf + direct_sz;
     int i, *p = (int *)tbuf;
 
     device_read_sector(tbuf, ino->indirect_table);
@@ -467,8 +485,9 @@ int p6fs_mkdir(const char *path, mode_t mode)
                         {.filename = "..", .inode_num = parent_ino},
                     };
                     // ".." gives parent another hard link
-                    ++inode_table[parent_ino].inode->link_count;
-                    flush_inode(parent_ino);
+                    struct inode_t* p_ino = inode_table[parent_ino].inode;
+                    ++p_ino->link_count;
+                    flush_inode(p_ino);
                     set_bitmap(block_bitmap, j, BLOCK_BITMAP_SECTOR_NUM);
                     // invalidate other directory entries
                     // write dentry block to device
@@ -696,7 +715,7 @@ int p6fs_readlink(const char *path, char *link, size_t size)
     unsigned char buf[SECTOR_SIZE];
     memset(buf, 0, sizeof(buf));
     device_read_sector(buf, inode->block[0]);
-    strcpy(link, (char *)buf);
+    memcpy(link, buf, size);
 
     return 0;
 }

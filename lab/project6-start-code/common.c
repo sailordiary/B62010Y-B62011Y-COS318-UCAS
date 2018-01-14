@@ -1094,13 +1094,18 @@ int p6fs_chmod(const char *path, mode_t mode)
 
     struct fuse_context *fuse_con = fuse_get_context();
     uid_t uid = fuse_con->uid;
-    gid_t gid = fuse_con->gid;
 
-    pthread_mutex_lock(&inode_table[inode_num].lock);
     struct inode_t *inode = inode_table[inode_num].inode;
-    inode->mode = mode;
-    flush_inode(inode);
-    pthread_mutex_unlock(&inode_table[inode_num].lock);
+    if (uid != inode->uid)
+        return -EPERM;
+    else {
+        pthread_mutex_lock(&inode_table[inode_num].lock);
+        inode->mode &= ~(S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP | S_IWGRP | S_IXGRP);
+        inode->mode |= (mode & (S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP | S_IWGRP | S_IXGRP));
+        inode->ctime = time(NULL);
+        flush_inode(inode);
+        pthread_mutex_unlock(&inode_table[inode_num].lock);
+    }
 
     return 0;
 }

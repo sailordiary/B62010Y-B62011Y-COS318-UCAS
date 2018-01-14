@@ -71,6 +71,7 @@ struct superblock_t{
 };
 
 struct inode_t{
+    int sector;                     // inode table sector in disk
     int size;                       // file size in bytes
     int type;                       // directory or file?
     mode_t mode;                    // permission mode

@@ -974,9 +974,9 @@ int p6fs_truncate(const char *path, off_t newSize)
 int p6fs_release(const char *path, struct fuse_file_info *fileInfo)
 {
     /* release fd */
-    int inode = inode_from_path(path);
-    if (inode < 0)
-        return inode;
+    int ino = inode_from_path(path);
+    if (ino < 0)
+        return ino;
     int i;
     for (i = 0; i < MAX_OPEN_FILE; i++)
     {

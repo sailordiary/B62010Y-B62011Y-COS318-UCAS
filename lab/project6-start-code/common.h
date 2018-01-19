@@ -26,7 +26,7 @@
 #define MAX_PATH_LEN 4096
 #define MAX_OPEN_FILE 65536
 
-#define P6FS_MAGIC 0x20180110
+#define P6FS_MAGIC 0x20180121
 #define PARTITION_SIZE 4000000000
 #define BYTES_PER_INODE 16384
 #define MAX_INODE (PARTITION_SIZE / BYTES_PER_INODE)
@@ -71,9 +71,7 @@ struct superblock_t{
 };
 
 struct inode_t{
-    int sector;                     // inode table sector in disk
     int size;                       // file size in bytes
-    int type;                       // directory or file?
     mode_t mode;                    // permission mode
     unsigned int link_count;        // link counter
 
@@ -91,7 +89,7 @@ struct inode_t{
 
 struct dentry{
     char filename[MAX_FILENAME_LEN];
-    int inode_num;
+    int ino;
 };
 
 /*  in-memory data structure   */
@@ -111,7 +109,7 @@ struct inode{
 struct file_info{
     int fd;         // file descriptor number
     int flags;      // open flags
-    int inode_num;  // inode number
+    int ino;        // inode number
     int used;       // whether this descriptor is occupied
     int rd;         // readable
     int wr;         // writable

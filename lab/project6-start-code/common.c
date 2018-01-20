@@ -36,7 +36,7 @@ void set_bitmap(unsigned long long *bitmap, int i, int offset)
 {
     unsigned char buf[SECTOR_SIZE];
     set_bit(bitmap, i);
-    memcpy(buf, bitmap + i / sizeof(unsigned long long), SECTOR_SIZE);
+    memcpy(buf, bitmap + i / SECTOR_SIZE, SECTOR_SIZE);
     device_write_sector(buf, offset + i / SECTOR_SIZE);
     device_flush();
 }
@@ -45,7 +45,7 @@ void clear_bitmap(unsigned long long *bitmap, int i, int offset)
 {
     unsigned char buf[SECTOR_SIZE];
     clear_bit(bitmap, i);
-    memcpy(buf, bitmap + i / sizeof(unsigned long long), SECTOR_SIZE);
+    memcpy(buf, bitmap + i / SECTOR_SIZE, SECTOR_SIZE);
     device_write_sector(buf, offset + i / SECTOR_SIZE);
     device_flush();
 }
@@ -55,6 +55,16 @@ void flush_inode(int ino)
     unsigned char buf[SECTOR_SIZE] = {0};
     memcpy(buf, inode_table[ino].inode, sizeof(struct inode_t));
     device_write_sector(buf, INODE_TABLE_SECTOR_NUM + ino);
+    device_flush();
+}
+
+void flush_superblock()
+{
+    unsigned char buf[SECTOR_SIZE] = {0};
+    memcpy(buf, &sblk, sizeof(superblock_t));
+    device_write_sector(buf, SUPERBLOCK_SECTOR_NUM);
+    device_flush();
+    device_write_sector(buf, SUPERBLOCK_BK_SECTOR_NUM);
     device_flush();
 }
 
@@ -154,6 +164,7 @@ void mkp6fs()
     memset(buf, 0, sizeof(buf));
     buf[0] = 0x1 << 7;
     device_write_sector(buf, INODE_BITMAP_SECTOR_NUM);
+    device_flush();
     device_write_sector(buf, BLOCK_BITMAP_SECTOR_NUM);
     device_flush();
 
@@ -539,7 +550,7 @@ int p6fs_rmdir(const char *path)
         else
             return -ENOTEMPTY;
     }
-    // free directory inode and dentry in parent
+    // free directory inode and remove dentry in parent
     int parent_ino = dentry_from_path(path);
     if (parent_ino < 0)
         return parent_ino;
@@ -551,12 +562,17 @@ int p6fs_rmdir(const char *path)
         if (ino == dp->ino)
         {
             dp->ino = -1;
-            pthread_mutex_lock(&inode_bitmap_lock);
-            clear_bitmap(inode_bitmap, inode_num, INODE_BITMAP_SECTOR_NUM);
-            pthread_mutex_unlock(&inode_bitmap_lock);
             break;
         }
     }
+    pthread_mutex_lock(&inode_bitmap_lock);
+    pthread_mutex_lock(&fs_superblock.lock);
+    clear_bitmap(inode_bitmap, ino, INODE_BITMAP_SECTOR_NUM);
+    --fs_superblock->sb.free_inode_cnt;
+    flush_superblock();
+    pthread_mutex_lock(&fs_superblock.lock);
+    pthread_mutex_unlock(&inode_bitmap_lock);
+
     return 0;
 }
 
@@ -834,9 +850,14 @@ int p6fs_unlink(const char *path)
     // hard links are not distinguishable
     pthread_mutex_lock(&inode_table[ino].lock);
     pthread_mutex_lock(&inode_bitmap_lock);
-    if (--inode->link_count == 0)
+    pthread_mutex_lock(&fs_superblock.lock);
+    if (--inode->link_count == 0) {
         clear_bitmap(inode_bitmap, inode_num, INODE_BITMAP_SECTOR_NUM);
+        --fs_superblock->sb.free_inode_cnt;
+        flush_superblock();
+    }
     flush_inode(inode);
+    pthread_mutex_unlock(&fs_superblock.lock);
     pthread_mutex_unlock(&inode_bitmap_lock);
     pthread_mutex_unlock(&inode_table[ino].lock);
 

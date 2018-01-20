@@ -227,7 +227,7 @@ int inode_from_path(const char *path)
     char path_cp[MAX_PATH_LEN];
     strcpy(path_cp, path);
     int depth = 0;
-    DEBUG("Path: %s", path)
+    DEBUG("Parsing path: %s", path)
     char *p = strtok(path_cp, "/");
     while (p)
     {
@@ -260,15 +260,7 @@ int inode_from_path(const char *path)
 			DEBUG("Found file %s in directory", p)
         }
         // destination reached: symlink or regular file
-        else if (S_ISLNK(inode->mode))
-        {
-            // read link path from block
-            device_read_sector(buf, inode->block[0]);
-            DEBUG("Symlink: %s -> %s", p, buf)
-            ino = inode_from_path((char *)buf);
-            if (ino < 0)
-                return ino;
-        }
+        // FUSE takes care of symbolic links automatically
         else if (S_ISREG(inode->mode))
         {
             // encountered a non-directory during traverse
@@ -1175,15 +1167,6 @@ int p6fs_chown(const char *path, uid_t uid, gid_t gid)
         return -EPERM;
     else
     {
-        unsigned char buf[SECTOR_SIZE];
-        // if the path refers to a symlink, find the real file
-        while (S_ISLNK(inode->mode))
-        {
-            memset(buf, 0, sizeof(buf));
-            device_read_sector(buf, inode->block[0]);
-            ino = inode_from_path((char *)buf);
-            inode = inode_table[ino].inode;
-        }
         pthread_mutex_lock(&inode_table[ino].lock);
         inode->uid = uid;
         inode->gid = gid;
@@ -1250,7 +1233,7 @@ int p6fs_statfs(const char *path, struct statvfs *statInfo)
     statInfo->f_blocks = fs_superblock.sb->total_block_cnt;
     statInfo->f_bfree = fs_superblock.sb->free_block_cnt;
     statInfo->f_bavail = fs_superblock.sb->free_block_cnt;
-    statInfo->f_files = fs_superblock.sb->total_inode_cnt - fs_superblock.sb->free_inode_cnt;
+    statInfo->f_files = fs_superblock.sb->total_inode_cnt;
     statInfo->f_ffree = fs_superblock.sb->free_inode_cnt;
     statInfo->f_favail = fs_superblock.sb->free_inode_cnt;
     statInfo->f_flag = 0;
@@ -1300,7 +1283,7 @@ void *p6fs_init(struct fuse_conn_info *conn)
         mountp6fs(&sblock_buf);
     else
     {
-        DEBUG("Creating filesystem on %s", DISK_ROOT)
+        INFO("Creating filesystem on %s", DISK_ROOT)
         mkp6fs();
     }
 

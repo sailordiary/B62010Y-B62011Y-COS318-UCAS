@@ -1,10 +1,13 @@
 #include "common.h"
 
 // KNOWN ISSUES
+// 01/21: Technically, metadata should be flushed back
+// to disk upon an fsync() operation, not instantly.
+// Also, it seems FUSE ignores the ino returned by getattr.
 // 01/20: The parent dentry block is not locked, so let's
 // keep our fingers crossed that another make operation
 // won't take our dentry space away.
-// Also, did not check if a file is busy.
+// 01/10: Did not check if a file is busy.
 
 /* define global variables here */
 struct superblock fs_superblock;
@@ -533,7 +536,7 @@ int p6fs_mkdir(const char *path, mode_t mode)
     inode->mode = S_IFDIR | mode;
     inode->size = BLOCK_SIZE;
     inode->link_count = 2;
-    inode->block[0] = DATABLOCK_SECTOR_NUM + ino;
+    inode->block[0] = DATABLOCK_SECTOR_NUM + dentry_blkn;
     inode->indirect_table = -1;
     inode->uid = uid;
     inode->gid = gid;
@@ -749,77 +752,105 @@ int p6fs_readlink(const char *path, char *link, size_t size)
 // Create a symbolic link named "link" which, when evaluated, will lead to "path".
 int p6fs_symlink(const char *path, const char *link)
 {
+    // NOTE: FUSE does not allow auto overwrite over existing symlinks
     int ino = inode_from_path(link);
-    if (ino >= 0)
+    if (ino > 0)
         return -EEXIST;
     int parent_ino = dentry_from_path(link);
     if (parent_ino < 0)
         return parent_ino;
     int parent_blk = inode_table[parent_ino].inode->block[0];
-    // allocate inode
-    // TODO: less fragmentation?
+
+    int i, dentry_blkn;
+    // allocate inode and data block
     pthread_mutex_lock(&inode_bitmap_lock);
-    int i, has_free_ino = 0;
-    unsigned char buf[SECTOR_SIZE];
-    memset(buf, 0, sizeof(buf));
-    strcpy((char *)buf, path);
+    int has_free_ino = 0;
     for (i = 0; i < MAX_INODE; ++i)
     {
         if (!test_bit(inode_bitmap, i))
         {
             has_free_ino = 1;
-            pthread_mutex_lock(&inode_table[i].lock);
-            set_bitmap(inode_bitmap, i, INODE_BITMAP_SECTOR_NUM);
-            struct inode_t *inode = inode_table[i].inode;
-            inode->ctime = time(NULL);
-            inode->mtime = time(NULL);
-            inode->atime = time(NULL);
-            inode->mode = S_IFLNK | 0777;   // NOTE: Linux convention for symlinks
-            inode->size = strlen(path);
-            inode->link_count = 1;
-            // allocate data block
-            pthread_mutex_lock(&block_bitmap_lock);
-            int j, has_free_blk = 0;
-            for (j = 0; j < TOTAL_BLOCKS; ++j)
-                if (test_bit(block_bitmap, j))
-                {
-                    set_bitmap(block_bitmap, j, BLOCK_BITMAP_SECTOR_NUM);
-                    has_free_blk = 1;
-                    break;
-                }
-            pthread_mutex_unlock(&block_bitmap_lock);
-            if (!has_free_blk)
-                return -ENOSPC;
-            inode->block[0] = DATABLOCK_SECTOR_NUM + j;
-            inode->indirect_table = -1;
-            flush_inode(i);
-            pthread_mutex_unlock(&inode_table[i].lock);
-
-            device_write_sector(buf, inode->block[0]);
-            device_flush();
-
             break;
         }
     }
+    if (!has_free_ino) {
+        pthread_mutex_unlock(&inode_bitmap_lock);
+        return -ENOMEM;
+    }
     ino = i;
-    pthread_mutex_unlock(&inode_bitmap_lock);
-    if (!has_free_ino)
+    // allocate dentry block
+    pthread_mutex_lock(&block_bitmap_lock);
+    int has_free_blk = 0;
+    for (i = 0; i < TOTAL_BLOCKS; ++i)
+        if (!test_bit(block_bitmap, i))
+        {
+            has_free_blk = 1;
+            break;
+        }
+    if (!has_free_blk) {
+        pthread_mutex_unlock(&block_bitmap_lock);
+        pthread_mutex_unlock(&inode_bitmap_lock);
         return -ENOSPC;
-    // allocate dentry
+    }
+    dentry_blkn = i;
+    
+    // add a dentry in parent folder
+    int has_free_entry = 0;
     char *last = strrchr(link, '/') + 1;
+    unsigned char buf[SECTOR_SIZE];
     device_read_sector(buf, parent_blk);
     struct dentry *dp = (struct dentry *)buf;
     for (i = 0; i < MAX_DENTRY; ++i, ++dp)
     {
         if (dp->ino == -1)
         {
-            strcpy(dp->filename, last);
-            dp->ino = ino;
-            device_write_sector(buf, parent_blk);
-            device_flush();
+            has_free_entry = 1;
             break;
         }
     }
+    if (!has_free_entry)
+    {
+        pthread_mutex_unlock(&block_bitmap_lock);
+        pthread_mutex_unlock(&inode_bitmap_lock);
+        return -ENOSPC;
+    }
+    else
+    {
+        set_bitmap(block_bitmap, dentry_blkn, BLOCK_BITMAP_SECTOR_NUM);
+        pthread_mutex_unlock(&block_bitmap_lock);
+        set_bitmap(inode_bitmap, ino, INODE_BITMAP_SECTOR_NUM);
+        pthread_mutex_unlock(&inode_bitmap_lock);
+        pthread_mutex_lock(&inode_table[ino].lock);
+        struct inode_t *inode = inode_table[ino].inode;
+        struct fuse_context *fuse_con = fuse_get_context();
+        uid_t uid = fuse_con->uid;
+        gid_t gid = fuse_con->gid;
+        inode->ctime = time(NULL);
+        inode->mtime = time(NULL);
+        inode->atime = time(NULL);
+        inode->mode = S_IFLNK | 0777;
+        inode->size = strlen(path);
+        inode->link_count = 1;
+        inode->block[0] = DATABLOCK_SECTOR_NUM + dentry_blkn;
+        inode->indirect_table = -1;
+        inode->uid = uid;
+        inode->gid = gid;
+        flush_inode(ino);
+        pthread_mutex_unlock(&inode_table[ino].lock);
+
+        // add dentry to parent folder
+        strcpy(dp->filename, last);
+        dp->ino = ino;
+        device_write_sector(buf, parent_blk);
+        device_flush();
+        // write symlink data
+        memset(buf, 0, sizeof(buf));
+        strcpy((char *)buf, path);
+        device_write_sector(buf, inode->block[0]);
+        device_flush();
+        DEBUG("Created symlink with i-node %d: %s -> %s", ino, link, path)
+    }
+
     return 0;
 }
 
@@ -836,14 +867,12 @@ int p6fs_link(const char *path, const char *newpath)
     if (parent_blk < 0)
         return parent_blk;
     parent_blk = inode_table[dentry_from_path(path)].inode->block[0];
-    // increment link count
     struct inode_t *inode = inode_table[ino].inode;
     // cannot create hard link to directory
     if (S_ISDIR(inode->mode))
         return -EISDIR;
-    ++inode->link_count;
-
-    // allocate dentry
+    
+    int has_free_entry = 0;
     unsigned char buf[SECTOR_SIZE];
     char *last = strrchr(newpath, '/') + 1;
     device_read_sector(buf, parent_blk);
@@ -853,12 +882,21 @@ int p6fs_link(const char *path, const char *newpath)
     {
         if (dp->ino == -1)
         {
-            strcpy(dp->filename, last);
-            dp->ino = ino;
-            device_write_sector(buf, parent_blk);
-            device_flush();
+            has_free_entry = 1;
             break;
         }
+    }
+    if (!has_free_entry)
+        return -ENOSPC;
+    else
+    {
+        // increment link count
+        ++inode->link_count;
+        // add dentry
+        strcpy(dp->filename, last);
+        dp->ino = ino;
+        device_write_sector(buf, parent_blk);
+        device_flush();
     }
     return 0;
 }
@@ -897,7 +935,7 @@ int p6fs_unlink(const char *path)
     pthread_mutex_lock(&inode_bitmap_lock);
     if (--inode->link_count == 0) {
         clear_bitmap(inode_bitmap, ino, INODE_BITMAP_SECTOR_NUM);
-        --fs_superblock.sb->free_inode_cnt;
+        ++fs_superblock.sb->free_inode_cnt;
         flush_superblock();
         recycle_blocks(ino, 0);
     }
@@ -1171,16 +1209,11 @@ int p6fs_rename(const char *path, const char *newpath)
         return -EINVAL;
 
     int parent_blk = dentry_from_path(path);
-    if (parent_blk < 0)
-        return parent_blk;
     parent_blk = inode_table[dentry_from_path(path)].inode->block[0];
     char name[MAX_FILENAME_LEN], newname[MAX_FILENAME_LEN];
-    char *last = strrchr(path, '/');
-    if (last == NULL)
-        // cannot rename root directory
+    char *last = strrchr(path, '/') + 1;
+    if (*last == '\0' || *last == '.')
         return -EINVAL;
-    else
-        last += 1;
     strcpy(name, last);
 
     last = strrchr(newpath, '/') + 1;
@@ -1198,6 +1231,8 @@ int p6fs_rename(const char *path, const char *newpath)
         if (!strcmp(name, dp->filename))
         {
             strcpy(dp->filename, newname);
+            device_write_sector(buf, parent_blk);
+            device_flush();
             return 0;
         }
     }

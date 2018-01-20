@@ -94,7 +94,7 @@ void mountp6fs(struct superblock_t *sblock)
     }
 
     // deserialize superblock
-    memcpy(&fs_superblock.sb, sblock, sizeof(struct superblock_t));
+    memcpy(fs_superblock.sb, sblock, sizeof(struct superblock_t));
     // deserialize bitmap and inode table
     unsigned char buf[SECTOR_SIZE], *dst_c = (unsigned char *)block_bitmap;
     for (i = BLOCK_BITMAP_SECTOR_NUM; i < INODE_BITMAP_SECTOR_NUM; ++i)
@@ -156,7 +156,7 @@ void mkp6fs()
 
     // clear entire bitmap but the first bit
     memset(buf, 0, sizeof(buf));
-    buf[0] = 0x1 << 32;
+    buf[0] = 0x1 << 7;
     device_write_sector(buf, INODE_BITMAP_SECTOR_NUM);
     device_flush();
     device_write_sector(buf, BLOCK_BITMAP_SECTOR_NUM);
@@ -198,7 +198,7 @@ void mkp6fs()
 int lookup_file(int blk, const char *filename)
 {
     /* read block from device */
-	DEBUG("Looking up for %s in dentry blk, sector %d", filename, blk)
+	DEBUG("Looking up %s in dentry blk, sector %d", filename, blk)
     unsigned char buf[SECTOR_SIZE];
     device_read_sector(buf, blk);
 
@@ -206,7 +206,6 @@ int lookup_file(int blk, const char *filename)
     struct dentry *dp = (struct dentry *)buf;
     for (i = 0; i < MAX_DENTRY; ++i, ++dp)
     {
-		if (dp->ino != -1) DEBUG("File %i: %s", i, dp->filename)
         if (!strcmp(filename, dp->filename) && dp->ino != -1)
             return dp->ino;
     }
@@ -259,6 +258,7 @@ int inode_from_path(const char *path)
         {
             // read link path from block
             device_read_sector(buf, inode->block[0]);
+            DEBUG("Symlink: %s -> %s", p, buf)
             ino = inode_from_path((char *)buf);
             if (ino < 0)
                 return ino;
@@ -600,7 +600,7 @@ int p6fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offs
     {
         if (dp->ino == -1)
             continue;
-        DEBUG("Directory listing: file %d - %s", i, dp->filename)
+        DEBUG("Entry %d: %s", i, dp->filename)
         stbuf.st_mode = inode_table[dp->ino].inode->mode;
         stbuf.st_ino = dp->ino;
         if ((ret = filler(buf, dp->filename, &stbuf, 0)))
@@ -1173,6 +1173,7 @@ int p6fs_rename(const char *path, const char *newpath)
 // Return statistics about the filesystem.
 int p6fs_statfs(const char *path, struct statvfs *statInfo)
 {
+    DEBUG("statfs request on %s", path)
     if (path[0] != '/')
         return -ENOENT;
     /* print fs status and statistics */
@@ -1181,9 +1182,12 @@ int p6fs_statfs(const char *path, struct statvfs *statInfo)
     statInfo->f_blocks = fs_superblock.sb->total_block_cnt;
     statInfo->f_bfree = fs_superblock.sb->free_block_cnt;
     statInfo->f_bavail = fs_superblock.sb->free_block_cnt;
-    statInfo->f_files = fs_superblock.sb->total_inode_cnt;
+    statInfo->f_files = fs_superblock.sb->total_inode_cnt - fs_superblock.sb->free_inode_cnt;
     statInfo->f_ffree = fs_superblock.sb->free_inode_cnt;
     statInfo->f_favail = fs_superblock.sb->free_inode_cnt;
+    statInfo->f_flag = 0;
+    statInfo->f_namemax = MAX_FILENAME_LEN;
+    DEBUG("Request completed")
 
     return 0;
 }

@@ -201,7 +201,7 @@ void mkp6fs()
 int lookup_file(int blk, const char *filename)
 {
     /* read block from device */
-	DEBUG("Looking up %s in dentry blk, sector %d", filename, blk)
+	DEBUG("Looking for %s in dentry blk at sector %d", filename, blk)
     unsigned char buf[SECTOR_SIZE];
     device_read_sector(buf, blk);
 
@@ -273,12 +273,12 @@ int inode_from_path(const char *path)
                 return -ENOTDIR;
             return ino;
         }
-        DEBUG("Accessing %s: i-node no. for %s is %d", path, p, ino)
+        DEBUG("Accessing %s: ino of %s is %d", path, p, ino)
         depth--;
         p = strtok(NULL, "/");
     }
 
-    return ino; // default: root
+    return ino;
 }
 
 // returns the parent inode to a given path
@@ -584,10 +584,13 @@ int p6fs_rmdir(const char *path)
         else
             return -ENOTEMPTY;
     }
+    // free dentry block
+    clear_bitmap(block_bitmap, inode->block[0], DATABLOCK_SECTOR_NUM);
     // free directory inode and remove dentry in parent
+    pthread_mutex_lock(&inode_table[ino].lock);
+    pthread_mutex_lock(&inode_bitmap_lock);
+    pthread_mutex_lock(&fs_superblock.lock);
     int parent_ino = dentry_from_path(path);
-    if (parent_ino < 0)
-        return parent_ino;
     int parent_blk = inode_table[parent_ino].inode->block[0];
     device_read_sector(buf, parent_blk);
     dp = (struct dentry *)buf;
@@ -599,13 +602,16 @@ int p6fs_rmdir(const char *path)
             break;
         }
     }
-    pthread_mutex_lock(&inode_bitmap_lock);
-    pthread_mutex_lock(&fs_superblock.lock);
+    device_write_sector(buf, parent_blk);
+    device_flush();
     clear_bitmap(inode_bitmap, ino, INODE_BITMAP_SECTOR_NUM);
-    --fs_superblock.sb->free_inode_cnt;
+    ++fs_superblock.sb->free_inode_cnt;
+    ++fs_superblock.sb->free_block_cnt;
     flush_superblock();
-    pthread_mutex_lock(&fs_superblock.lock);
+    pthread_mutex_unlock(&fs_superblock.lock);
     pthread_mutex_unlock(&inode_bitmap_lock);
+    pthread_mutex_unlock(&inode_table[ino].lock);
+    DEBUG("Directory %s removed", path)
 
     return 0;
 }
@@ -621,7 +627,6 @@ int p6fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offs
     struct inode_t *dir_inode = inode_table[dir_ino].inode;
     unsigned char dbuf[SECTOR_SIZE];
     // a directory block should take no more than a sector
-    DEBUG("Directory dentry block sector is #%d", dir_inode->block[0])
     device_read_sector(dbuf, dir_inode->block[0]);
 
     int i, ret;
@@ -631,7 +636,6 @@ int p6fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offs
     {
         if (dp->ino == -1)
             continue;
-        DEBUG("Entry %d: %s", i, dp->filename)
         stbuf.st_mode = inode_table[dp->ino].inode->mode;
         stbuf.st_ino = dp->ino;
         if ((ret = filler(buf, dp->filename, &stbuf, 0)))
@@ -869,7 +873,7 @@ int p6fs_unlink(const char *path)
     if (S_ISDIR(inode->mode))
         return -EISDIR;
 
-    // remove dentry
+    // delete dentry
     char *last = strrchr(path, '/');
     unsigned char buf[SECTOR_SIZE];
     int parent_blk = dentry_from_path(path);
@@ -889,16 +893,17 @@ int p6fs_unlink(const char *path)
     // free inode
     // hard links are not distinguishable
     pthread_mutex_lock(&inode_table[ino].lock);
-    pthread_mutex_lock(&inode_bitmap_lock);
     pthread_mutex_lock(&fs_superblock.lock);
+    pthread_mutex_lock(&inode_bitmap_lock);
     if (--inode->link_count == 0) {
         clear_bitmap(inode_bitmap, ino, INODE_BITMAP_SECTOR_NUM);
         --fs_superblock.sb->free_inode_cnt;
         flush_superblock();
+        recycle_blocks(ino, 0);
     }
     flush_inode(ino);
-    pthread_mutex_unlock(&fs_superblock.lock);
     pthread_mutex_unlock(&inode_bitmap_lock);
+    pthread_mutex_unlock(&fs_superblock.lock);
     pthread_mutex_unlock(&inode_table[ino].lock);
 
     return 0;
@@ -1126,17 +1131,14 @@ int p6fs_chown(const char *path, uid_t uid, gid_t gid)
         return ino;
 
     struct inode_t *inode = inode_table[ino].inode;
-    if (S_ISDIR(inode->mode))
-        return -EISDIR;
-
     struct fuse_context *fuse_con = fuse_get_context();
     uid_t current_uid = fuse_con->uid;
-    unsigned char buf[SECTOR_SIZE];
     if (current_uid != inode->uid)
         return -EPERM;
     else
     {
-        // if path refers to a symlink, find the real file
+        unsigned char buf[SECTOR_SIZE];
+        // if the path refers to a symlink, find the real file
         while (S_ISLNK(inode->mode))
         {
             memset(buf, 0, sizeof(buf));
@@ -1144,10 +1146,12 @@ int p6fs_chown(const char *path, uid_t uid, gid_t gid)
             ino = inode_from_path((char *)buf);
             inode = inode_table[ino].inode;
         }
+        pthread_mutex_lock(&inode_table[ino].lock);
         inode->uid = uid;
         inode->gid = gid;
         inode->ctime = time(NULL);
         flush_inode(ino);
+        pthread_mutex_unlock(&inode_table[ino].lock);
     }
 
     return 0;

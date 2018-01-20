@@ -451,13 +451,10 @@ int p6fs_mkdir(const char *path, mode_t mode)
 {
     /* do path parse here
       create dentry and update your index */
-    DEBUG("Creating directory %s with mode %x", path, mode)
-    DEBUG("Bitmaps: %llu, %llu", inode_bitmap[0], block_bitmap[0])
     int ino = inode_from_path(path);
     if (ino >= 0)
         return -EEXIST;
     int parent_ino = dentry_from_path(path);
-    DEBUG("Parent ino search returns %d", parent_ino)
     if (parent_ino < 0)
         return parent_ino;
     // dentry block no.
@@ -527,14 +524,19 @@ int p6fs_mkdir(const char *path, mode_t mode)
     pthread_mutex_unlock(&inode_bitmap_lock);
     pthread_mutex_lock(&inode_table[ino].lock);
     struct inode_t *inode = inode_table[ino].inode;
+    struct fuse_context *fuse_con = fuse_get_context();
+    uid_t uid = fuse_con->uid;
+    gid_t gid = fuse_con->gid;
     inode->ctime = time(NULL);
     inode->mtime = time(NULL);
     inode->atime = time(NULL);
     inode->mode = S_IFDIR | mode;
     inode->size = BLOCK_SIZE;
     inode->link_count = 2;
-    inode->block[0] = DATABLOCK_SECTOR_NUM + i;
+    inode->block[0] = DATABLOCK_SECTOR_NUM + ino;
     inode->indirect_table = -1;
+    inode->uid = uid;
+    inode->gid = gid;
     flush_inode(ino);
     pthread_mutex_unlock(&inode_table[ino].lock);
     
@@ -547,14 +549,13 @@ int p6fs_mkdir(const char *path, mode_t mode)
     // invalidate other directory entries
     memset(buf, -1, sizeof(buf));
     struct dentry default_entries[2] = {
-                {.filename = ".", .ino = i},
+                {.filename = ".", .ino = ino},
                 {.filename = "..", .ino = parent_ino},
             };
     memcpy(buf, default_entries, sizeof(default_entries));
-    device_write_sector(buf, DATABLOCK_SECTOR_NUM + dentry_blkn * SECTOR_SIZE);
+    device_write_sector(buf, DATABLOCK_SECTOR_NUM + dentry_blkn);
     device_flush();
     DEBUG("Created new directory with i-node %d, dentry blk #%d", ino, dentry_blkn)
-    DEBUG("Bitmaps: %llu, %llu", inode_bitmap[0], block_bitmap[0])
 
     return 0;
 }
@@ -620,6 +621,7 @@ int p6fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offs
     struct inode_t *dir_inode = inode_table[dir_ino].inode;
     unsigned char dbuf[SECTOR_SIZE];
     // a directory block should take no more than a sector
+    DEBUG("Directory dentry block sector is #%d", dir_inode->block[0])
     device_read_sector(dbuf, dir_inode->block[0]);
 
     int i, ret;
@@ -647,17 +649,16 @@ int p6fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offs
 // NOTE: we implement regular files
 int p6fs_mknod(const char *path, mode_t mode, dev_t dev)
 {
-    /* do path parse here
-    create file */
+    /* essentialy the same as mkdir and symlink */
     int ino = inode_from_path(path);
     if (ino >= 0)
         return -EEXIST;
     int parent_ino = dentry_from_path(path);
     if (parent_ino < 0)
         return parent_ino;
+    // dentry block no.
     int parent_blk = inode_table[parent_ino].inode->block[0];
-    // allocate inode
-    // TODO: less fragmentation?
+    // find free i-node
     pthread_mutex_lock(&inode_bitmap_lock);
     int i, has_free_ino = 0;
     for (i = 0; i < MAX_INODE; ++i)
@@ -665,41 +666,16 @@ int p6fs_mknod(const char *path, mode_t mode, dev_t dev)
         if (!test_bit(inode_bitmap, i))
         {
             has_free_ino = 1;
-            pthread_mutex_lock(&inode_table[i].lock);
-            set_bitmap(inode_bitmap, i, INODE_BITMAP_SECTOR_NUM);
-            struct inode_t *inode = inode_table[i].inode;
-            inode->ctime = time(NULL);
-            inode->mtime = time(NULL);
-            inode->atime = time(NULL);
-            inode->mode = mode | S_IFREG;
-            inode->size = BLOCK_SIZE;
-            inode->link_count = 1;
-            // allocate data block
-            pthread_mutex_lock(&block_bitmap_lock);
-            int j, has_free_blk = 0;
-            for (j = 0; j < TOTAL_BLOCKS; ++j)
-                if (test_bit(block_bitmap, j))
-                {
-                    set_bitmap(block_bitmap, j, BLOCK_BITMAP_SECTOR_NUM);
-                    has_free_blk = 1;
-                    break;
-                }
-            pthread_mutex_unlock(&block_bitmap_lock);
-            if (!has_free_blk)
-                return -ENOSPC;
-            inode->block[0] = DATABLOCK_SECTOR_NUM + j;
-            inode->indirect_table = -1;
-            flush_inode(i);
-            pthread_mutex_unlock(&inode_table[i].lock);
-
             break;
         }
     }
+    if (!has_free_ino) {
+        pthread_mutex_unlock(&inode_bitmap_lock);
+        return -ENOMEM;
+    }
     ino = i;
-    pthread_mutex_unlock(&inode_bitmap_lock);
-    if (!has_free_ino)
-        return -ENOSPC;
-    // allocate dentry
+    // add a dentry in parent folder
+    int has_free_entry = 0;
     char *last = strrchr(path, '/') + 1;
     unsigned char buf[SECTOR_SIZE];
     device_read_sector(buf, parent_blk);
@@ -708,13 +684,43 @@ int p6fs_mknod(const char *path, mode_t mode, dev_t dev)
     {
         if (dp->ino == -1)
         {
-            strcpy(dp->filename, last);
-            dp->ino = ino;
-            device_write_sector(buf, parent_blk);
-            device_flush();
+            has_free_entry = 1;
             break;
         }
     }
+    if (!has_free_entry) {
+        pthread_mutex_unlock(&inode_bitmap_lock);
+        return -ENOSPC;
+    }
+
+    // allocate inode
+    set_bitmap(inode_bitmap, ino, INODE_BITMAP_SECTOR_NUM);
+    pthread_mutex_unlock(&inode_bitmap_lock);
+    pthread_mutex_lock(&inode_table[ino].lock);
+    struct inode_t *inode = inode_table[ino].inode;
+    struct fuse_context *fuse_con = fuse_get_context();
+    uid_t uid = fuse_con->uid;
+    gid_t gid = fuse_con->gid;
+    inode->ctime = time(NULL);
+    inode->mtime = time(NULL);
+    inode->atime = time(NULL);
+    inode->mode = S_IFREG | mode;
+    inode->size = 0;
+    inode->link_count = 1;
+    inode->block[0] = -1;
+    inode->indirect_table = -1;
+    inode->uid = uid;
+    inode->gid = gid;
+    flush_inode(ino);
+    pthread_mutex_unlock(&inode_table[ino].lock);
+    
+    // add dentry to parent folder
+    strcpy(dp->filename, last);
+    dp->ino = ino;
+    device_write_sector(buf, parent_blk);
+    device_flush();
+    DEBUG("Created new file node with i-node %d", ino)
+
     return 0;
 }
 
@@ -899,7 +905,7 @@ int p6fs_unlink(const char *path)
 }
 
 /* Open a file. Check for existence and permissions and return either
-success or an error code. */
+  success or an error code. */
 int p6fs_open(const char *path, struct fuse_file_info *fileInfo)
 {
     /*
@@ -920,6 +926,7 @@ int p6fs_open(const char *path, struct fuse_file_info *fileInfo)
         if (!fd_table[i].used)
         {
             fd_table[i].used = 1;
+            fd_table[i].ino = ino;
             fi = &fd_table[i];
             break;
         }
@@ -935,18 +942,17 @@ int p6fs_open(const char *path, struct fuse_file_info *fileInfo)
 
     // check open flags, such as O_RDONLY
     // O_CREATE is transformed to mknod() + open() by fuse, so no need to create file here
-    if ((fileInfo->flags & 3) == O_RDONLY)
+    if ((fileInfo->flags & O_RDONLY) == O_RDONLY)
         fi->rd = 1;
-    if ((fileInfo->flags & 3) == O_WRONLY)
+    if ((fileInfo->flags & O_WRONLY) == O_WRONLY)
         fi->wr = 1;
-    if ((fileInfo->flags & 3) == O_APPEND)
+    if ((fileInfo->flags & O_APPEND) == O_APPEND)
         fi->app = 1;
-    if ((fileInfo->flags & 3) == O_RDWR)
+    if ((fileInfo->flags & O_RDWR) == O_RDWR)
     {
         fi->rd = 1;
         fi->wr = 1;
     }
-    fi->ino = ino;
 
     fileInfo->fh = (uint64_t)fi;
     return 0;
@@ -958,10 +964,8 @@ int p6fs_open(const char *path, struct fuse_file_info *fileInfo)
 int p6fs_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fileInfo)
 {
     /* get inode from file handle and do operation */
-    struct file_info *fi = (struct file_info *)fileInfo;
-    int ino = inode_from_path(path);
-    if (ino < 0)
-        return ino;
+    struct file_info *fi = (struct file_info *)fileInfo->fh;
+    int ino = fi->ino;
     // check permission
     if (fi->rd == 0)
         return -EACCES;
@@ -979,10 +983,8 @@ int p6fs_read(const char *path, char *buf, size_t size, off_t offset, struct fus
 int p6fs_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fileInfo)
 {
     /* get inode from file handle and do operation */
-    struct file_info *fi = (struct file_info *)fileInfo;
-    int ino = inode_from_path(path);
-    if (ino < 0)
-        return ino;
+    struct file_info *fi = (struct file_info *)fileInfo->fh;
+    int ino = fi->ino;
     struct inode_t *inode = inode_table[ino].inode;
     // check flags
     if (fi->wr == 0)
@@ -995,7 +997,6 @@ int p6fs_write(const char *path, const char *buf, size_t size, off_t offset, str
             // either file is too large or device has no free space
             return ret;
     write_blocks(ino, buf, offset, size);
-    fi->ino = ino;
 
     return size;
 }
@@ -1026,24 +1027,17 @@ int p6fs_truncate(const char *path, off_t newSize)
 //optional
 //p6fs_flush(const char *path, struct fuse_file_info *fileInfo)
 //int p6fs_fsync(const char *path, int datasync, struct fuse_file_info *fi)
+
+/* release is called when FUSE is completely done with a file;
+  at that point, you can free up any temporarily allocated data structures. */
 int p6fs_release(const char *path, struct fuse_file_info *fileInfo)
 {
     /* release fd */
-    int ino = inode_from_path(path);
-    if (ino < 0)
-        return ino;
-    int i;
-    for (i = 0; i < MAX_OPEN_FILE; i++)
-    {
-        if (fd_table[i].ino == ino && fd_table[i].used)
-        {
-            fd_table[i].ino = -1;
-            fd_table[i].used = 0;
-            return 0;
-        }
-    }
+    struct file_info *fi = (struct file_info *)fileInfo->fh;
+    fd_table[fi->fd].ino = -1;
+    fd_table[fi->fd].used = 0;
 
-    return -EBADF;
+    return 0;
 }
 
 int p6fs_getattr(const char *path, struct stat *statbuf)
@@ -1055,6 +1049,7 @@ int p6fs_getattr(const char *path, struct stat *statbuf)
 
     memset(statbuf, 0, sizeof(stat));
     struct inode_t *inode = inode_table[ino].inode;
+    statbuf->st_ino = ino + 1;
     statbuf->st_nlink = inode->link_count;
     statbuf->st_size = inode->size;
     statbuf->st_mode = inode->mode;
@@ -1073,8 +1068,14 @@ int p6fs_utime(const char *path, struct utimbuf *ubuf)
     struct inode_t *inode = inode_table[ino].inode;
     struct fuse_context *fuse_con = fuse_get_context();
     uid_t current_uid = fuse_con->uid;
-    // TODO: check permission
-    if (current_uid == inode->uid || 1)
+
+    if (current_uid != inode->uid) {
+        if (ubuf == NULL)
+            return -EACCES;
+        else
+            return -EPERM;
+    }
+    else
     {
         if (ubuf == NULL)
         {

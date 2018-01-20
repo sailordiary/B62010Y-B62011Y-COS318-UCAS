@@ -1,6 +1,6 @@
 #!/bin/bash
-umount mnt
-dd if=/dev/zero of=disk.img bs=4K count=10000
+sudo umount mnt
+dd if=/dev/zero of=image bs=4096 count=1 conv=notrunc
 make clean && make
 ./p6fs disk.img mnt -o logfile="log"
 sleep 1

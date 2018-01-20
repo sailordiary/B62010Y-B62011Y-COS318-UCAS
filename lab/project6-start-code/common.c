@@ -61,7 +61,7 @@ void flush_inode(int ino)
 void flush_superblock()
 {
     unsigned char buf[SECTOR_SIZE] = {0};
-    memcpy(buf, &sblk, sizeof(superblock_t));
+    memcpy(buf, &sblk, sizeof(struct superblock_t));
     device_write_sector(buf, SUPERBLOCK_SECTOR_NUM);
     device_flush();
     device_write_sector(buf, SUPERBLOCK_BK_SECTOR_NUM);
@@ -71,6 +71,7 @@ void flush_superblock()
 // mount an existing filesystem
 void mountp6fs(struct superblock_t *sblock)
 {
+	DEBUG("Mounting P6FS...")
     // initialize in-memory structure
     if ((pthread_mutex_init(&fs_superblock.lock, NULL) ||
          pthread_mutex_init(&block_bitmap_lock, NULL) ||
@@ -118,6 +119,7 @@ void mountp6fs(struct superblock_t *sblock)
         memcpy(dst, buf, SECTOR_SIZE);
         dst += SECTOR_SIZE;
     }
+    DEBUG("P6FS mounted.")
 }
 
 // make a fresh filesystem on device
@@ -148,7 +150,7 @@ void mkp6fs()
     uid_t uid = fuse_con->uid;
     gid_t gid = fuse_con->gid;
     struct inode_t root_inode = {.size = BLOCK_SIZE,
-                                 .mode = S_ISDIR | 0755,
+                                 .mode = S_IFDIR | 0755,
                                  .uid = uid,
                                  .gid = gid,
                                  .link_count = 2,
@@ -157,7 +159,7 @@ void mkp6fs()
                                  .ctime = time(NULL),
                                  .atime = time(NULL),
                                  .mtime = time(NULL)};
-    memcpy(inode_table[0].inode, root_inode, sizeof(struct inode_t));
+    memcpy(inode_table[0].inode, &root_inode, sizeof(struct inode_t));
     flush_inode(0);
 
     // clear entire bitmap but the first bit
@@ -181,6 +183,7 @@ void mkp6fs()
     device_flush();
 
     // initialize file descriptor table
+    int i;
     for (i = 0; i < MAX_OPEN_FILE; ++i)
     {
         fd_table[i].fd = i;
@@ -196,6 +199,7 @@ void mkp6fs()
 int lookup_file(int blk, const char *filename)
 {
     /* read block from device */
+	DEBUG("Looking up for %s in dentry blk %d", filename, blk)
     unsigned char buf[SECTOR_SIZE];
     device_read_sector(buf, blk);
 
@@ -203,6 +207,7 @@ int lookup_file(int blk, const char *filename)
     struct dentry *dp = (struct dentry *)buf;
     for (i = 0; i < MAX_DENTRY; ++i, ++dp)
     {
+		DEBUG("Item %i: %s", i, dp->filename)
         if (!strcmp(filename, dp->filename) && dp->ino != -1)
             return dp->ino;
     }
@@ -220,11 +225,10 @@ int inode_from_path(const char *path)
     int depth = 0;
     DEBUG("Path: %s", path)
     char *p = strtok(path_cp, "/");
-    DEBUG("Now: %s", p)
     while (p)
     {
         ++depth;
-        p = strtok(path_cp, "/");
+        p = strtok(NULL, "/");
     }
     unsigned char buf[SECTOR_SIZE];
     // read root dentry
@@ -233,7 +237,7 @@ int inode_from_path(const char *path)
 
     // look up inode and dentry alternately
     memset(buf, 0, sizeof(buf));
-    int dentry_blkn, inode_num = 0;
+    int dentry_blkn, ino = 0;
     struct inode_t *inode;
 
     strcpy(path_cp, path);
@@ -242,36 +246,39 @@ int inode_from_path(const char *path)
     {
         // TODO: EACCES permission check
         /* /home/yuan-hang/... */
-        inode = inode_table[inode_num].inode;
+        inode = inode_table[ino].inode;
+        DEBUG("Struct addr of %d: %x", ino, inode)
         // check inode type
         if (S_ISDIR(inode->mode))
         {
             dentry_blkn = inode->block[0];
-            if ((inode_num = lookup_file(dentry_blkn, p)) == -1)
+            DEBUG("Looking up %s in block %d", p, dentry_blkn)
+            if ((ino = lookup_file(dentry_blkn, p)) == -1)
                 return -ENOENT;
+			DEBUG("Found file %s in directory", p)
         }
         // destination reached: symlink or regular file
         else if (S_ISLNK(inode->mode))
         {
             // read link path from block
             device_read_sector(buf, inode->block[0]);
-            inode_num = inode_from_path((char *)buf);
-            if (inode_num < 0)
-                return inode_num;
+            ino = inode_from_path((char *)buf);
+            if (ino < 0)
+                return ino;
         }
         else if (S_ISREG(inode->mode))
         {
             // encountered a non-directory during traverse
             if (depth > 0)
                 return -ENOTDIR;
-            return inode_num;
+            return ino;
         }
-        DEBUG("Accessing %s: i-node for %s is %d", path, p, inode_num)
+        DEBUG("Accessing %s: i-node no. for %s is %d", path, p, ino)
         depth--;
-        p = strtok(path_cp, "/");
+        p = strtok(NULL, "/");
     }
 
-    return inode_num; // default: root
+    return ino; // default: root
 }
 
 // returns the parent inode to a given path
@@ -402,7 +409,7 @@ int alloc_blocks(int ino, int new_size)
                 if (test_bit(block_bitmap, i))
                 {
                     set_bitmap(block_bitmap, i, BLOCK_BITMAP_SECTOR_NUM);
-                    ino->indirect_table = i;
+                    inode->indirect_table = i;
                     flush_inode(ino);
                 }
             }
@@ -467,7 +474,7 @@ int p6fs_mkdir(const char *path, mode_t mode)
             inode->ctime = time(NULL);
             inode->mtime = time(NULL);
             inode->atime = time(NULL);
-            inode->mode = mode | S_ISDIR;
+            inode->mode = mode | S_IFDIR;
             inode->size = BLOCK_SIZE;
             inode->link_count = 2;
             // allocate dentry block
@@ -503,7 +510,7 @@ int p6fs_mkdir(const char *path, mode_t mode)
             break;
         }
     }
-    inode_num = i;
+    ino = i;
     pthread_mutex_unlock(&inode_bitmap_lock);
     if (!has_free_ino)
         return -ENOMEM;
@@ -517,7 +524,7 @@ int p6fs_mkdir(const char *path, mode_t mode)
         if (dp->ino == -1)
         {
             strcpy(dp->filename, last);
-            dp->ino = inode_num;
+            dp->ino = ino;
             device_write_sector(buf, parent_blk);
             device_flush();
             break;
@@ -568,7 +575,7 @@ int p6fs_rmdir(const char *path)
     pthread_mutex_lock(&inode_bitmap_lock);
     pthread_mutex_lock(&fs_superblock.lock);
     clear_bitmap(inode_bitmap, ino, INODE_BITMAP_SECTOR_NUM);
-    --fs_superblock->sb.free_inode_cnt;
+    --fs_superblock.sb->free_inode_cnt;
     flush_superblock();
     pthread_mutex_lock(&fs_superblock.lock);
     pthread_mutex_unlock(&inode_bitmap_lock);
@@ -637,7 +644,7 @@ int p6fs_mknod(const char *path, mode_t mode, dev_t dev)
             inode->ctime = time(NULL);
             inode->mtime = time(NULL);
             inode->atime = time(NULL);
-            inode->mode = mode | S_ISREG;
+            inode->mode = mode | S_IFREG;
             inode->size = BLOCK_SIZE;
             inode->link_count = 1;
             // allocate data block
@@ -689,7 +696,7 @@ int p6fs_readlink(const char *path, char *link, size_t size)
 {
     int ino = inode_from_path(path);
     if (ino < 0)
-        return inode_num;
+        return ino;
     struct inode_t *inode = inode_table[ino].inode;
     if (!(S_ISLNK(inode->mode)))
         return -EINVAL;
@@ -705,8 +712,8 @@ int p6fs_readlink(const char *path, char *link, size_t size)
 // Create a symbolic link named "link" which, when evaluated, will lead to "path".
 int p6fs_symlink(const char *path, const char *link)
 {
-    int inode_num = inode_from_path(link);
-    if (inode_num >= 0)
+    int ino = inode_from_path(link);
+    if (ino >= 0)
         return -EEXIST;
     int parent_ino = dentry_from_path(link);
     if (parent_ino < 0)
@@ -730,7 +737,7 @@ int p6fs_symlink(const char *path, const char *link)
             inode->ctime = time(NULL);
             inode->mtime = time(NULL);
             inode->atime = time(NULL);
-            inode->mode = S_ISLNK | 0777;   // NOTE: Linux convention for symlinks
+            inode->mode = S_IFLNK | 0777;   // NOTE: Linux convention for symlinks
             inode->size = strlen(path);
             inode->link_count = 1;
             // allocate data block
@@ -852,11 +859,11 @@ int p6fs_unlink(const char *path)
     pthread_mutex_lock(&inode_bitmap_lock);
     pthread_mutex_lock(&fs_superblock.lock);
     if (--inode->link_count == 0) {
-        clear_bitmap(inode_bitmap, inode_num, INODE_BITMAP_SECTOR_NUM);
-        --fs_superblock->sb.free_inode_cnt;
+        clear_bitmap(inode_bitmap, ino, INODE_BITMAP_SECTOR_NUM);
+        --fs_superblock.sb->free_inode_cnt;
         flush_superblock();
     }
-    flush_inode(inode);
+    flush_inode(ino);
     pthread_mutex_unlock(&fs_superblock.lock);
     pthread_mutex_unlock(&inode_bitmap_lock);
     pthread_mutex_unlock(&inode_table[ino].lock);
@@ -912,7 +919,7 @@ int p6fs_open(const char *path, struct fuse_file_info *fileInfo)
         fi->rd = 1;
         fi->wr = 1;
     }
-    fi->ino = inode_num;
+    fi->ino = ino;
 
     fileInfo->fh = (uint64_t)fi;
     return 0;
@@ -971,7 +978,7 @@ int p6fs_truncate(const char *path, off_t newSize)
 {
     int ino = inode_from_path(path);
     if (ino < 0)
-        return inode;
+        return ino;
     struct inode_t *inode = inode_table[ino].inode;
     if (inode->size == newSize)
         return 0;
@@ -1069,16 +1076,16 @@ int p6fs_chmod(const char *path, mode_t mode)
     struct fuse_context *fuse_con = fuse_get_context();
     uid_t uid = fuse_con->uid;
 
-    struct inode_t *inode = inode_table[inode_num].inode;
+    struct inode_t *inode = inode_table[ino].inode;
     if (uid != inode->uid)
         return -EPERM;
     else {
-        pthread_mutex_lock(&inode_table[inode_num].lock);
+        pthread_mutex_lock(&inode_table[ino].lock);
         inode->mode &= ~ALLPERMS;
         inode->mode |= (mode & ALLPERMS);
         inode->ctime = time(NULL);
-        flush_inode(inode);
-        pthread_mutex_unlock(&inode_table[inode_num].lock);
+        flush_inode(ino);
+        pthread_mutex_unlock(&inode_table[ino].lock);
     }
 
     return 0;
@@ -1213,7 +1220,7 @@ void *p6fs_init(struct fuse_conn_info *conn)
         {
             exist = 1;
             INFO("Found P6FS filesystem on disk %s", DISK_ROOT)
-            INFO("Using backup superblock")
+            INFO("Using backup superblock at sector %d", SUPERBLOCK_BK_SECTOR_NUM)
             // CHKDSK: fix superblock
             device_write_sector(buf, SUPERBLOCK_SECTOR_NUM);
             device_flush();

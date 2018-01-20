@@ -15,8 +15,8 @@ struct inode_t inode_info[MAX_INODE];
 struct dentry root;
 struct file_info fd_table[MAX_OPEN_FILE];
 
-unsigned long long block_bitmap[BLOCK_MAP_NARRAY];
-unsigned long long inode_bitmap[INODE_MAP_NARRAY];
+unsigned long long block_bitmap[BLOCK_MAP_NARRAY] = {0};
+unsigned long long inode_bitmap[INODE_MAP_NARRAY] = {0};
 pthread_mutex_t block_bitmap_lock, inode_bitmap_lock;
 
 /*
@@ -149,16 +149,21 @@ void mkp6fs()
     // write new superblock to device
     memcpy(buf, &sblock, sizeof(struct superblock_t));
     device_write_sector(buf, SUPERBLOCK_SECTOR_NUM);
+    device_flush();
     device_write_sector(buf, SUPERBLOCK_BK_SECTOR_NUM);
     device_flush();
 
     // clear entire bitmap but the first bit
     memset(buf, 0, sizeof(buf));
-    buf[0] = 0x1 << 7;
-    device_write_sector(buf, INODE_BITMAP_SECTOR_NUM);
-    device_flush();
-    device_write_sector(buf, BLOCK_BITMAP_SECTOR_NUM);
-    device_flush();
+    int i;
+    for (i = BLOCK_BITMAP_SECTOR_NUM; i < INODE_TABLE_SECTOR_NUM; ++i)
+    {
+        device_write_sector(buf, i);
+        device_flush();
+    }
+
+    set_bitmap(block_bitmap, 0, BLOCK_BITMAP_SECTOR_NUM);
+    set_bitmap(inode_bitmap, 0, INODE_BITMAP_SECTOR_NUM);
 
     // create root structure
     // NOTE: the mountpoint dentry always occupies the first datablock
@@ -283,6 +288,8 @@ int dentry_from_path(const char *path)
     char path_cp[MAX_FILENAME_LEN];
     strcpy(path_cp, path);
     char *last = strrchr(path_cp, '/');
+    if (last == path_cp)
+        return 0;
     *last = '\0';
 
     return inode_from_path(path_cp);
@@ -444,10 +451,13 @@ int p6fs_mkdir(const char *path, mode_t mode)
 {
     /* do path parse here
       create dentry and update your index */
+    DEBUG("Creating directory %s with mode %x", path, mode)
+    DEBUG("Bitmaps: %llu, %llu", inode_bitmap[0], block_bitmap[0])
     int ino = inode_from_path(path);
     if (ino >= 0)
         return -EEXIST;
     int parent_ino = dentry_from_path(path);
+    DEBUG("Parent ino search returns %d", parent_ino)
     if (parent_ino < 0)
         return parent_ino;
     // dentry block no.
@@ -473,7 +483,7 @@ int p6fs_mkdir(const char *path, mode_t mode)
     pthread_mutex_lock(&block_bitmap_lock);
     int has_free_blk = 0;
     for (i = 0; i < TOTAL_BLOCKS; ++i)
-        if (test_bit(block_bitmap, i))
+        if (!test_bit(block_bitmap, i))
         {
             has_free_blk = 1;
             break;
@@ -520,7 +530,7 @@ int p6fs_mkdir(const char *path, mode_t mode)
     inode->ctime = time(NULL);
     inode->mtime = time(NULL);
     inode->atime = time(NULL);
-    inode->mode = mode | S_IFDIR;
+    inode->mode = S_IFDIR | mode;
     inode->size = BLOCK_SIZE;
     inode->link_count = 2;
     inode->block[0] = DATABLOCK_SECTOR_NUM + i;
@@ -543,6 +553,8 @@ int p6fs_mkdir(const char *path, mode_t mode)
     memcpy(buf, default_entries, sizeof(default_entries));
     device_write_sector(buf, DATABLOCK_SECTOR_NUM + dentry_blkn * SECTOR_SIZE);
     device_flush();
+    DEBUG("Created new directory with i-node %d, dentry blk #%d", ino, dentry_blkn)
+    DEBUG("Bitmaps: %llu, %llu", inode_bitmap[0], block_bitmap[0])
 
     return 0;
 }

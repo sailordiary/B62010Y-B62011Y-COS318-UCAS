@@ -17,7 +17,7 @@
 #include "disk.h"
 #include "logging.h"
 
-#define DISK_ROOT "/home/yuan-hang/Dev/os/project6-start-code/disk.img"
+#define DISK_ROOT "/home/wch/cas/project6-start-code/image"
 
 #define MAX_DIRECT_NUM 12
 #define DIRECT_BLOCK_BYTES (MAX_DIRECT_NUM * (int) sizeof(int))

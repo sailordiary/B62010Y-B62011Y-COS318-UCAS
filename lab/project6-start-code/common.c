@@ -94,30 +94,39 @@ void mountp6fs(struct superblock_t *sblock)
     }
 
     // deserialize superblock
-    memcpy(&(fs_superblock.sb), sblock, sizeof(struct superblock_t));
+    memcpy(&fs_superblock.sb, sblock, sizeof(struct superblock_t));
     // deserialize bitmap and inode table
-    unsigned char buf[SECTOR_SIZE], *dst = (unsigned char *)block_bitmap;
+    unsigned char buf[SECTOR_SIZE], *dst_c = (unsigned char *)block_bitmap;
     for (i = BLOCK_BITMAP_SECTOR_NUM; i < INODE_BITMAP_SECTOR_NUM; ++i)
     {
         device_read_sector(buf, i);
-        memcpy(dst, buf, SECTOR_SIZE);
-        dst += SECTOR_SIZE;
+        memcpy(dst_c, buf, SECTOR_SIZE);
+        dst_c += SECTOR_SIZE;
     }
 
-    dst = (unsigned char *)inode_bitmap;
+    dst_c = (unsigned char *)inode_bitmap;
     for (i = INODE_BITMAP_SECTOR_NUM; i < INODE_TABLE_SECTOR_NUM; ++i)
     {
         device_read_sector(buf, i);
-        memcpy(dst, buf, SECTOR_SIZE);
-        dst += SECTOR_SIZE;
+        memcpy(dst_c, buf, SECTOR_SIZE);
+        dst_c += SECTOR_SIZE;
     }
 
-    dst = (unsigned char *)inode_table;
+    struct inode_t *dst_ino = inode_info;
     for (i = INODE_TABLE_SECTOR_NUM; i < DATABLOCK_SECTOR_NUM; ++i)
     {
         device_read_sector(buf, i);
-        memcpy(dst, buf, SECTOR_SIZE);
-        dst += SECTOR_SIZE;
+        memcpy(dst_ino, buf, sizeof(struct inode_t));
+        dst_ino++;
+    }
+
+    // initialize file descriptor table
+    for (i = 0; i < MAX_OPEN_FILE; ++i)
+    {
+        fd_table[i].fd = i;
+        fd_table[i].flags = 0;
+        fd_table[i].ino = -1;
+        fd_table[i].used = 0;
     }
     DEBUG("P6FS mounted.")
 }
@@ -145,7 +154,28 @@ void mkp6fs()
     device_write_sector(buf, SUPERBLOCK_BK_SECTOR_NUM);
     device_flush();
 
-    // create inode entries and bitmaps
+    // clear entire bitmap but the first bit
+    memset(buf, 0, sizeof(buf));
+    buf[0] = 0x1 << 32;
+    device_write_sector(buf, INODE_BITMAP_SECTOR_NUM);
+    device_flush();
+    device_write_sector(buf, BLOCK_BITMAP_SECTOR_NUM);
+    device_flush();
+
+    // create root structure
+    // NOTE: the mountpoint dentry always occupies the first datablock
+    struct dentry root_entries[2] = {
+        {.filename = ".", .ino = 0},
+        {.filename = "..", .ino = 0},
+    };
+    // NOTE: workaround; invalidate the rest of the sector
+    memset(buf, -1, sizeof(buf));
+    memcpy(buf, root_entries, sizeof(root_entries));
+    device_write_sector(buf, DATABLOCK_SECTOR_NUM);
+    device_flush();
+
+    mountp6fs(&sblock);
+    // allocate root inode
     struct fuse_context *fuse_con = fuse_get_context();
     uid_t uid = fuse_con->uid;
     gid_t gid = fuse_con->gid;
@@ -161,45 +191,14 @@ void mkp6fs()
                                  .mtime = time(NULL)};
     memcpy(inode_table[0].inode, &root_inode, sizeof(struct inode_t));
     flush_inode(0);
-
-    // clear entire bitmap but the first bit
-    memset(buf, 0, sizeof(buf));
-    buf[0] = 0x1 << 7;
-    device_write_sector(buf, INODE_BITMAP_SECTOR_NUM);
-    device_flush();
-    device_write_sector(buf, BLOCK_BITMAP_SECTOR_NUM);
-    device_flush();
-
-    // create root structure
-    // NOTE: the mountpoint dentry always occupies the first datablock
-    struct dentry root_entries[2] = {
-        {.filename = ".", .ino = 0},
-        {.filename = "..", .ino = 0},
-    };
-    // NOTE: workaround; invalidate the rest of the sector
-    memset(buf, -1, sizeof(buf));
-    memcpy(buf, root_entries, sizeof(struct dentry) * 2);
-    device_write_sector(buf, DATABLOCK_SECTOR_NUM);
-    device_flush();
-
-    // initialize file descriptor table
-    int i;
-    for (i = 0; i < MAX_OPEN_FILE; ++i)
-    {
-        fd_table[i].fd = i;
-        fd_table[i].flags = 0;
-        fd_table[i].ino = -1;
-        fd_table[i].used = 0;
-    }
-
-    mountp6fs(&sblock);
+    DEBUG("P6FS build complete.")
 }
 
 // look up a given file from dentry block
 int lookup_file(int blk, const char *filename)
 {
     /* read block from device */
-	DEBUG("Looking up for %s in dentry blk %d", filename, blk)
+	DEBUG("Looking up for %s in dentry blk, sector %d", filename, blk)
     unsigned char buf[SECTOR_SIZE];
     device_read_sector(buf, blk);
 
@@ -207,7 +206,7 @@ int lookup_file(int blk, const char *filename)
     struct dentry *dp = (struct dentry *)buf;
     for (i = 0; i < MAX_DENTRY; ++i, ++dp)
     {
-		DEBUG("Item %i: %s", i, dp->filename)
+		if (dp->ino != -1) DEBUG("File %i: %s", i, dp->filename)
         if (!strcmp(filename, dp->filename) && dp->ino != -1)
             return dp->ino;
     }
@@ -247,12 +246,10 @@ int inode_from_path(const char *path)
         // TODO: EACCES permission check
         /* /home/yuan-hang/... */
         inode = inode_table[ino].inode;
-        DEBUG("Struct addr of %d: %x", ino, inode)
         // check inode type
         if (S_ISDIR(inode->mode))
         {
             dentry_blkn = inode->block[0];
-            DEBUG("Looking up %s in block %d", p, dentry_blkn)
             if ((ino = lookup_file(dentry_blkn, p)) == -1)
                 return -ENOENT;
 			DEBUG("Found file %s in directory", p)
@@ -603,6 +600,7 @@ int p6fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offs
     {
         if (dp->ino == -1)
             continue;
+        DEBUG("Directory listing: file %d - %s", i, dp->filename)
         stbuf.st_mode = inode_table[dp->ino].inode->mode;
         stbuf.st_ino = dp->ino;
         if ((ret = filler(buf, dp->filename, &stbuf, 0)))
@@ -1234,9 +1232,6 @@ void *p6fs_init(struct fuse_conn_info *conn)
         DEBUG("Creating filesystem on %s", DISK_ROOT)
         mkp6fs();
     }
-    DEBUG("i-node number of / is %d", inode_from_path("/"))
-    DEBUG("i-node number of /. is %d", inode_from_path("/."))
-    DEBUG("i-node number of /.. is %d", inode_from_path("/.."))
 
     /* the fuse_context is a global variable, you can use it in
      all file operation, and you could also get uid, gid and pid

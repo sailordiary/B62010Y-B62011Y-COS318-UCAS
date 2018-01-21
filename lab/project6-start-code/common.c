@@ -1,6 +1,8 @@
 #include "common.h"
 #include "md5.h"
 
+#define FRESH_TEST
+
 // KNOWN ISSUES
 // 01/21: Technically, metadata should be flushed back
 // to disk upon an fsync() operation, not instantly.
@@ -340,7 +342,6 @@ void read_blocks(int ino, char *buf, off_t offset, size_t size)
     unsigned char dbuf[SECTOR_SIZE];
     char *dst = buf;
     device_read_sector(dbuf, inode->block[dir_st_block]);
-    DEBUG("Read block content: %s, up to %d bytes", dbuf + dir_st_off, dir_st_sz)
     memcpy(dst, dbuf + dir_st_off, dir_st_sz);
     dst += dir_st_sz;
     // copy other direct blocks
@@ -445,16 +446,14 @@ void recycle_blocks(int ino, int new_size)
     // no need to lock block bitmap since we are releasing the resources
     pthread_mutex_lock(&fs_superblock.lock);
     int i;
-    for (i = nblocks; i < MAX_INDIRECT_NUM; ++i) {
+    for (i = nblocks; i < nblocks_old; ++i) {
         clear_bitmap(block_bitmap, inode->block[i], BLOCK_BITMAP_SECTOR_NUM);
         inode->block[i] = -1;
     }
     int nindir_old = nblocks_old - MAX_INDIRECT_NUM;
-    if (nindir_old >= 0)
+    if (nblocks_old >= MAX_INDIRECT_NUM)
     {
-        int nindir = nblocks - MAX_INDIRECT_NUM;
-        if (nindir < 0)
-            nindir = 0;
+        int nindir = (nblocks < MAX_INDIRECT_NUM) ? 0 : nblocks - MAX_INDIRECT_NUM;
         unsigned char tbuf[SECTOR_SIZE];
         device_read_sector(tbuf, inode->indirect_table);
         int i, *p = (int *)tbuf;
@@ -486,6 +485,8 @@ int alloc_blocks(int ino, int new_size)
     int nblocks_old = inode->size / BLOCK_SIZE + (inode->size % BLOCK_SIZE ? 1 : 0),
         nblocks = new_size / BLOCK_SIZE + (new_size % BLOCK_SIZE ? 1 : 0);
     int new_blocks = nblocks - nblocks_old;
+    if (new_blocks == 0)
+        return 0;
     pthread_mutex_lock(&inode_table[ino].lock);
     pthread_mutex_lock(&block_bitmap_lock);
     int indir_blk = -1;
@@ -1463,7 +1464,11 @@ void *p6fs_init(struct fuse_conn_info *conn)
         }
     }
 
+    #ifndef FRESH_TEST
     if (exist)
+    #else
+    if (0)
+    #endif
         mountp6fs(&sblock_buf, rebuild_flag);
     else
     {

@@ -1,8 +1,6 @@
 #include "common.h"
 #include "md5.h"
 
-#define FRESH_TEST
-
 // KNOWN ISSUES
 // 01/21: Technically, metadata should be flushed back
 // to disk upon an fsync() operation, not instantly.
@@ -134,10 +132,10 @@ void mountp6fs(struct superblock_t *sblock, int flag)
         sblock->total_inode_cnt = MAX_INODE;
         sblock->free_block_cnt = TOTAL_BLOCKS;
         sblock->free_inode_cnt = MAX_INODE;
-        for (i = 0; i = MAX_INODE; ++i)
+        for (i = 0; i < MAX_INODE; ++i)
             if (test_bit(inode_bitmap, i))
                 --sblock->free_inode_cnt;
-        for (i = 0; i = TOTAL_BLOCKS; ++i)
+        for (i = 0; i < TOTAL_BLOCKS; ++i)
             if (test_bit(block_bitmap, i))
                 --sblock->free_block_cnt;
         sblock->block_map = SECTOR_SIZE * BLOCK_BITMAP_SECTOR_NUM;
@@ -334,7 +332,7 @@ void read_blocks(int ino, char *buf, off_t offset, size_t size)
     int dir_st_block = offset / BLOCK_SIZE;
     int dir_st_off = offset % BLOCK_SIZE;
     int file_end = offset + size;
-    int dir_st_sz = (file_end > BLOCK_SIZE) ? BLOCK_SIZE - dir_st_off : size;
+    int dir_st_sz = (file_end > BLOCK_SIZE) ? BLOCK_SIZE - dir_st_off : (int)size;
     int indir_sz = file_end - DIRECT_BLOCK_BYTES;
     int dir_ed_block = (indir_sz > 0) ? MAX_DIRECT_NUM :
                         (file_end / BLOCK_SIZE + (file_end % BLOCK_SIZE ? 1 : 0));
@@ -381,7 +379,7 @@ void write_blocks(int ino, const char *buf, off_t offset, size_t size)
     int dir_st_block = offset / BLOCK_SIZE;
     int dir_st_off = offset % BLOCK_SIZE;
     int file_end = offset + size;
-    int dir_st_sz = (file_end > BLOCK_SIZE) ? BLOCK_SIZE - dir_st_off : size;
+    int dir_st_sz = (file_end > BLOCK_SIZE) ? BLOCK_SIZE - dir_st_off : (int)size;
     int indir_sz = (file_end > DIRECT_BLOCK_BYTES) ? file_end - DIRECT_BLOCK_BYTES : 0;
     int dir_ed_block = (indir_sz > 0) ? MAX_DIRECT_NUM :
                         (file_end / BLOCK_SIZE + (file_end % BLOCK_SIZE ? 1 : 0));
@@ -1464,11 +1462,7 @@ void *p6fs_init(struct fuse_conn_info *conn)
         }
     }
 
-    #ifndef FRESH_TEST
     if (exist)
-    #else
-    if (0)
-    #endif
         mountp6fs(&sblock_buf, rebuild_flag);
     else
     {

@@ -244,13 +244,19 @@ int inode_from_path(const char *path)
     int dentry_blkn, ino = 0;
     struct inode_t *inode;
 
+    struct fuse_context *fuse_con = fuse_get_context();
+    uid_t current_uid = fuse_con->uid;
+    gid_t current_gid = fuse_con->uid;
     strcpy(path_cp, path);
     p = strtok(path_cp, "/");
     while (p)
     {
-        // TODO: EACCES permission check
-        /* /home/yuan-hang/... */
         inode = inode_table[ino].inode;
+        // check permission
+        if (!((inode->mode & S_IROTH) ||
+            (inode->mode & S_IRUSR && current_uid == inode->uid) ||
+            (inode->mode & S_IRGRP && current_gid == inode->gid)))
+            return -EACCES;
         // check inode type
         if (S_ISDIR(inode->mode))
         {
@@ -294,30 +300,44 @@ int dentry_from_path(const char *path)
 void read_blocks(int ino, char *buf, off_t offset, size_t size)
 {
     struct inode_t *inode = inode_table[ino].inode;
-    int direct_sz = DIRECT_BLOCK_BYTES - offset;
-    if (direct_sz >= 0)
-        // copy direct blocks
-        memcpy(buf, inode->block + offset, direct_sz);
-    if (offset + size <= DIRECT_BLOCK_BYTES)
-        return;
-    // copy indirect blocks
-    int indirect_sz = size - direct_sz;
-    int n_indirect = indirect_sz / BLOCK_SIZE;
-    if (indirect_sz % BLOCK_SIZE)
-        n_indirect++;
-    unsigned char tbuf[SECTOR_SIZE];
+    int dir_st_block = offset / BLOCK_SIZE;
+    int dir_st_off = offset % BLOCK_SIZE;
+    int dir_st_sz = BLOCK_SIZE - dir_st_off;
+    int file_end = offset + size;
+    int indir_sz = file_end - DIRECT_BLOCK_BYTES;
+    int dir_ed_block = (indir_sz > 0) ? MAX_DIRECT_NUM :
+                        (file_end / BLOCK_SIZE + (file_end % BLOCK_SIZE ? 1 : 0));
+    // copy the first direct block with offset
     unsigned char dbuf[SECTOR_SIZE];
-
-    char *dst = buf + direct_sz, len;
-    int i, *p = (int *)tbuf;
-
-    device_read_sector(tbuf, inode->indirect_table);
-    for (i = 0; i < n_indirect; ++i)
+    char *dst = buf;
+    device_read_sector(dbuf, inode->block[dir_st_block]);
+    memcpy(dst, dbuf + dir_st_off, dir_st_sz);
+    dst += dir_st_sz;
+    // copy other direct blocks
+    int i;
+    for (i = dir_st_block + 1; i < dir_ed_block; ++i)
     {
-        len = (indirect_sz > BLOCK_SIZE) ? BLOCK_SIZE : indirect_sz;
-        device_read_sector(dbuf, p[i]);
-        memcpy(dst + i * BLOCK_SIZE, dbuf, len);
-        indirect_sz -= len;
+        device_read_sector(dbuf, inode->block[i]);
+        memcpy(dst, dbuf, SECTOR_SIZE);
+        dst += SECTOR_SIZE;
+    }
+    // copy indirect blocks
+    if (indir_sz)
+    {
+        // read indirect block table
+        unsigned char tbuf[SECTOR_SIZE];
+        device_read_sector(tbuf, inode->indirect_table);
+        int *p = (int *)tbuf;
+        int nindir = indir_sz / BLOCK_SIZE + (indir_sz % BLOCK_SIZE ? 1 : 0);
+        for (i = 0; i < nindir; ++i)
+        {
+            device_read_sector(dbuf, p[i]);
+            if (i == nindir - 1)
+                memcpy(dst, dbuf, indir_sz % BLOCK_SIZE);
+            else
+                memcpy(dst, dbuf, SECTOR_SIZE);
+            dst += SECTOR_SIZE;
+        }
     }
     return;
 }
@@ -326,31 +346,53 @@ void read_blocks(int ino, char *buf, off_t offset, size_t size)
 void write_blocks(int ino, const char *buf, off_t offset, size_t size)
 {
     struct inode_t *inode = inode_table[ino].inode;
-    int direct_sz = DIRECT_BLOCK_BYTES - offset;
-    if (direct_sz >= 0)
-        // write to direct blocks
-        memcpy(inode->block + offset, buf, direct_sz);
-    if (offset + size <= DIRECT_BLOCK_BYTES)
-        return;
-    // write to indirect blocks
-    unsigned char tbuf[SECTOR_SIZE];    // buffer for the indirect table
-    unsigned char dbuf[SECTOR_SIZE];    // buffer for the blocks
-
-    int indirect_sz = size - direct_sz, len;
-    int n_indirect = indirect_sz / BLOCK_SIZE;
-    if (indirect_sz % BLOCK_SIZE)
-        ++n_indirect;
-    const char *src = buf + direct_sz;
-    int i, *p = (int *)tbuf;
-
-    device_read_sector(tbuf, inode->indirect_table);
-    for (i = 0; i < n_indirect; ++i)
+    int dir_st_block = offset / BLOCK_SIZE;
+    int dir_st_off = offset % BLOCK_SIZE;
+    int dir_st_sz = BLOCK_SIZE - dir_st_off;
+    int file_end = offset + size;
+    int indir_sz = file_end - DIRECT_BLOCK_BYTES;
+    int dir_ed_block = (indir_sz > 0) ? MAX_DIRECT_NUM :
+                        (file_end / BLOCK_SIZE + (file_end % BLOCK_SIZE ? 1 : 0));
+    // write the first direct block with an offset
+    unsigned char dbuf[SECTOR_SIZE];
+    char *src = buf;
+    device_read_sector(dbuf, inode->block[dir_st_block]);
+    memcpy(dbuf + dir_st_off, src, dir_st_sz);
+    device_write_sector(dbuf, inode->block[dir_st_block]);
+    device_flush();
+    src += dir_st_sz;
+    // write other direct blocks
+    int i;
+    for (i = dir_st_block + 1; i < dir_ed_block; ++i)
     {
-        len = (indirect_sz > BLOCK_SIZE) ? BLOCK_SIZE : indirect_sz;
-        memcpy(dbuf, src + i * BLOCK_SIZE, len);
-        device_write_sector(dbuf, p[i]);
-        device_flush();
-        indirect_sz -= len;
+        if (i == dir_ed_block - 1 && indir_sz < 0)
+            // to prevent overflow on *buf
+            memcpy(dbuf, src, file_end % BLOCK_SIZE);
+        else
+            memcpy(dbuf, src, SECTOR_SIZE);
+        device_write_sector(dbuf, inode->block[i]);
+        src += SECTOR_SIZE;
+    }
+    // write indirect blocks
+    if (indir_sz)
+    {
+        // read indirect block table
+        unsigned char tbuf[SECTOR_SIZE];
+        device_read_sector(tbuf, inode->indirect_table);
+        int *p = (int *)tbuf;
+        int nindir = indir_sz / BLOCK_SIZE + (indir_sz % BLOCK_SIZE ? 1 : 0);
+        for (i = 0; i < nindir; ++i)
+        {
+            if (i == nindir - 1) {
+                memset(dbuf, 0, sizeof(dbuf));
+                memcpy(dbuf, src, indir_sz % BLOCK_SIZE);
+            }
+            else
+                memcpy(dbuf, src, SECTOR_SIZE);
+            device_write_sector(dbuf, p[i]);
+            device_flush();
+            src += SECTOR_SIZE;
+        }
     }
     return;
 }
@@ -725,7 +767,7 @@ int p6fs_mknod(const char *path, mode_t mode, dev_t dev)
     inode->mode = S_IFREG | mode;
     inode->size = 0;
     inode->link_count = 1;
-    inode->block[0] = -1;
+    memset(inode->block, -1, sizeof(inode->block));
     inode->indirect_table = -1;
     inode->uid = uid;
     inode->gid = gid;
@@ -980,7 +1022,8 @@ int p6fs_open(const char *path, struct fuse_file_info *fileInfo)
     if (ino < 0)
         return ino;
 
-    inode_table[ino].inode->atime = time(NULL);
+    struct inode_t *inode = inode_table[ino].inode;
+    inode->atime = time(NULL);
     // assign and init your file handle
     struct file_info *fi = NULL;
     int i;
@@ -997,22 +1040,40 @@ int p6fs_open(const char *path, struct fuse_file_info *fileInfo)
     if (!fi)
         return -ENFILE;
 
-    // TODO: how is this useful in any sense?
-    /*
     struct fuse_context *fuse_con = fuse_get_context();
-    fuse_con->private_data = malloc(...);
-    */
+    uid_t current_uid = fuse_con->uid;
+    gid_t current_gid = fuse_con->uid;
 
     // check open flags, such as O_RDONLY
     // O_CREATE is transformed to mknod() + open() by fuse, so no need to create file here
-    if ((fileInfo->flags & O_RDONLY) == O_RDONLY)
+    if ((fileInfo->flags & O_RDONLY) == O_RDONLY) {
+        if (!((inode->mode & S_IROTH) ||
+            (inode->mode & S_IRUSR && current_uid == inode->uid) ||
+            (inode->mode & S_IRGRP && current_gid == inode->gid)))
+            return -EACCES;
         fi->rd = 1;
-    if ((fileInfo->flags & O_WRONLY) == O_WRONLY)
+    }
+    if ((fileInfo->flags & O_WRONLY) == O_WRONLY) {
+        if (!((inode->mode & S_IWOTH) ||
+            (inode->mode & S_IWUSR && current_uid == inode->uid) ||
+            (inode->mode & S_IWGRP && current_gid == inode->gid)))
+            return -EACCES;
         fi->wr = 1;
-    if ((fileInfo->flags & O_APPEND) == O_APPEND)
+    }
+        
+    if ((fileInfo->flags & O_APPEND) == O_APPEND) {
+        if (!((inode->mode & S_IWOTH) ||
+            (inode->mode & S_IWUSR && current_uid == inode->uid) ||
+            (inode->mode & S_IWGRP && current_gid == inode->gid)))
+            return -EACCES;
         fi->app = 1;
+    }
     if ((fileInfo->flags & O_RDWR) == O_RDWR)
     {
+        if (!((inode->mode & (S_IROTH | S_IWOTH)) ||
+            (inode->mode & (S_IRUSR | S_IWUSR) && current_uid == inode->uid) ||
+            (inode->mode & (S_IRGRP | S_IWGRP) && current_gid == inode->gid)))
+            return -EACCES;
         fi->rd = 1;
         fi->wr = 1;
     }

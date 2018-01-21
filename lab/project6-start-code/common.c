@@ -1,4 +1,5 @@
 #include "common.h"
+#include "md5.h"
 
 // KNOWN ISSUES
 // 01/21: Technically, metadata should be flushed back
@@ -1398,16 +1399,26 @@ void *p6fs_init(struct fuse_conn_info *conn)
     {
         exist = 1;
         INFO("Found P6FS filesystem on disk %s", DISK_ROOT)
-        INFO("Using original superblock")
+        char md5_orig[33], md5_backup[33];
+        strcpy(md5_orig, digestMemory(buf, sizeof(struct superblock_t)));
+        DEBUG("Superblock #1 MD5: %s", md5_orig)
+        INFO("Verifying superblock checksum")
+        device_read_sector(buf, SUPERBLOCK_BK_SECTOR_NUM);
+        strcpy(md5_backup, digestMemory(buf, sizeof(struct superblock_t)));
+        DEBUG("Superblock #2 MD5: %s", md5_backup)
+        if (!strcmp(md5_orig, md5_backup))
+            INFO("Checksum test passed")
+        else
+            ERR("Checksum test failed, rebuilding superblock")
+            // TODO: rebuild superblock
     }
     else
     {
-        device_read_sector(buf, SUPERBLOCK_BK_SECTOR_NUM);
+        // use backup superblock
         memcpy(&sblock_buf, buf, sizeof(struct superblock_t));
         if (sblock_buf.magic_number == P6FS_MAGIC)
         {
             exist = 1;
-            INFO("Found P6FS filesystem on disk %s", DISK_ROOT)
             INFO("Using backup superblock at sector %d", SUPERBLOCK_BK_SECTOR_NUM)
             // CHKDSK: fix superblock
             device_write_sector(buf, SUPERBLOCK_SECTOR_NUM);

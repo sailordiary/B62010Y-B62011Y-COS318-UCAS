@@ -17,10 +17,10 @@
 #include "disk.h"
 #include "logging.h"
 
-#define DISK_ROOT "/home/wch/cas/project6-start-code/image"
+#define DISK_ROOT "/home/stu/share/project6-start-code/image"
 
 #define MAX_DIRECT_NUM 12
-#define DIRECT_BLOCK_BYTES (MAX_DIRECT_NUM * (int) sizeof(int))
+#define DIRECT_BLOCK_BYTES (MAX_DIRECT_NUM * SECTOR_SIZE)
 #define MAX_INDIRECT_NUM (BLOCK_SIZE / (int) sizeof(int))
 #define MAX_FILENAME_LEN 256
 #define MAX_PATH_LEN 4096
@@ -45,10 +45,6 @@
 #define INODE_TABLE_SECTOR_NUM 67 // 8192 blocks * 128B
 #define DATABLOCK_SECTOR_NUM 8259
 #define SUPERBLOCK_BK_SECTOR_NUM (PARTITION_SIZE / SECTOR_SIZE - 1) // 4*10^9B=976562 blks or 2^32B=1048576 blks?
-
-#define ISREG 0
-#define ISDIR 1
-#define ISLNK 2
 
 // See: https://stackoverflow.com/questions/2525310/how-to-define-and-work-with-an-array-of-bits-in-c
 #define set_bit(A, k)     ( *(A + (k/32)) |= (1 << (k%32)) )

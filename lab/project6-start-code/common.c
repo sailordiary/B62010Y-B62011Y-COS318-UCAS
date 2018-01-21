@@ -302,8 +302,8 @@ void read_blocks(int ino, char *buf, off_t offset, size_t size)
     struct inode_t *inode = inode_table[ino].inode;
     int dir_st_block = offset / BLOCK_SIZE;
     int dir_st_off = offset % BLOCK_SIZE;
-    int dir_st_sz = BLOCK_SIZE - dir_st_off;
     int file_end = offset + size;
+    int dir_st_sz = (file_end > BLOCK_SIZE) ? BLOCK_SIZE - dir_st_off : size;
     int indir_sz = file_end - DIRECT_BLOCK_BYTES;
     int dir_ed_block = (indir_sz > 0) ? MAX_DIRECT_NUM :
                         (file_end / BLOCK_SIZE + (file_end % BLOCK_SIZE ? 1 : 0));
@@ -311,6 +311,7 @@ void read_blocks(int ino, char *buf, off_t offset, size_t size)
     unsigned char dbuf[SECTOR_SIZE];
     char *dst = buf;
     device_read_sector(dbuf, inode->block[dir_st_block]);
+    DEBUG("Read block content: %s, up to %d bytes", dbuf + dir_st_off, dir_st_sz)
     memcpy(dst, dbuf + dir_st_off, dir_st_sz);
     dst += dir_st_sz;
     // copy other direct blocks
@@ -349,9 +350,8 @@ void write_blocks(int ino, const char *buf, off_t offset, size_t size)
     struct inode_t *inode = inode_table[ino].inode;
     int dir_st_block = offset / BLOCK_SIZE;
     int dir_st_off = offset % BLOCK_SIZE;
-    int dir_st_sz = BLOCK_SIZE - dir_st_off;
     int file_end = offset + size;
-    DEBUG("Direct bytes: %d", DIRECT_BLOCK_BYTES)
+    int dir_st_sz = (file_end > BLOCK_SIZE) ? BLOCK_SIZE - dir_st_off : size;
     int indir_sz = (file_end > DIRECT_BLOCK_BYTES) ? file_end - DIRECT_BLOCK_BYTES : 0;
     int dir_ed_block = (indir_sz > 0) ? MAX_DIRECT_NUM :
                         (file_end / BLOCK_SIZE + (file_end % BLOCK_SIZE ? 1 : 0));
@@ -360,6 +360,7 @@ void write_blocks(int ino, const char *buf, off_t offset, size_t size)
     char *src = buf;
     device_read_sector(dbuf, inode->block[dir_st_block]);
     memcpy(dbuf + dir_st_off, src, dir_st_sz);
+    DEBUG("Write direct block at #%d with offset %d, size %d", inode->block[dir_st_block], dir_st_off, dir_st_sz)
     device_write_sector(dbuf, inode->block[dir_st_block]);
     device_flush();
     src += dir_st_sz;
@@ -537,6 +538,7 @@ int alloc_blocks(int ino, int new_size)
         fs_superblock.sb->free_block_cnt -= new_blocks;
         flush_superblock();
         pthread_mutex_unlock(&fs_superblock.lock);
+        inode->size = new_size;
         flush_inode(ino);
     }
     pthread_mutex_unlock(&block_bitmap_lock);
@@ -1143,6 +1145,7 @@ int p6fs_read(const char *path, char *buf, size_t size, off_t offset, struct fus
     struct file_info *fi = (struct file_info *)fileInfo->fh;
     int ino = fi->ino;
     struct inode_t *inode = inode_table[ino].inode;
+    DEBUG("Initiating read: ino %d, offset %d, size %d", ino, offset, size)
     if (offset >= inode->size)
         return 0;
 

@@ -328,13 +328,13 @@ void write_blocks(int ino, const char *buf, off_t offset, size_t size)
     struct inode_t *inode = inode_table[ino].inode;
     int direct_sz = DIRECT_BLOCK_BYTES - offset;
     if (direct_sz >= 0)
-        // copy direct blocks
+        // write to direct blocks
         memcpy(inode->block + offset, buf, direct_sz);
     if (offset + size <= DIRECT_BLOCK_BYTES)
         return;
-    // copy indirect blocks
-    unsigned char tbuf[SECTOR_SIZE];
-    unsigned char dbuf[SECTOR_SIZE];
+    // write to indirect blocks
+    unsigned char tbuf[SECTOR_SIZE];    // buffer for the indirect table
+    unsigned char dbuf[SECTOR_SIZE];    // buffer for the blocks
 
     int indirect_sz = size - direct_sz, len;
     int n_indirect = indirect_sz / BLOCK_SIZE;
@@ -359,26 +359,41 @@ void write_blocks(int ino, const char *buf, off_t offset, size_t size)
 void recycle_blocks(int ino, int new_size)
 {
     struct inode_t *inode = inode_table[ino].inode;
-    // recycle rear indirect blocks
-    // blocks need not be zeroed, modify the bitmap only
-    int diff = inode->size - new_size;
-    diff /= BLOCK_SIZE;
-    if (inode->size <= DIRECT_BLOCK_BYTES || diff == 0)
+    // recycle rear blocks
+    // modify block bitmap, no need to zero the blocks
+    int nblocks_old = (inode->size / BLOCK_SIZE) + (inode->size % BLOCK_SIZE ? 1 : 0);
+    int nblocks = (new_size / BLOCK_SIZE) + (new_size % BLOCK_SIZE ? 1 : 0);
+    // reducing mutex overhead
+    if (nblocks_old == nblocks)
         return;
-    else
-    {
-        unsigned char tbuf[SECTOR_SIZE];
-        int *p = (int *)tbuf, blocks = inode->size / BLOCK_SIZE;
-        if (inode->size % BLOCK_SIZE != 0)
-            blocks++;
-        int i = new_size / BLOCK_SIZE + 1;
-        if (new_size % BLOCK_SIZE != 0)
-            i++;
-        pthread_mutex_lock(&block_bitmap_lock);
-        for (; i < blocks; ++i)
-            set_bitmap(block_bitmap, p[i], BLOCK_BITMAP_SECTOR_NUM);
-        pthread_mutex_unlock(&block_bitmap_lock);
+    // starting with the first indirect block to recycle
+    // no need to lock block bitmap since we are releasing the resources
+    pthread_mutex_lock(&inode_table[ino].lock);
+    int i;
+    for (i = nblocks; i < MAX_INDIRECT_NUM; ++i) {
+        clear_bitmap(block_bitmap, inode->block[i], BLOCK_BITMAP_SECTOR_NUM);
+        inode->block[i] = -1;
     }
+    int nindir_old = nblocks_old - MAX_INDIRECT_NUM;
+    if (nindir_old >= 0)
+    {
+        int nindir = nblocks - MAX_INDIRECT_NUM;
+        if (nindir < 0)
+            nindir = 0;
+        unsigned char tbuf[SECTOR_SIZE];
+        device_read_sector(tbuf, inode->indirect_table);
+        int i, *p = (int *)tbuf;
+        for (i = nindir; i < nindir_old; ++i)
+            clear_bitmap(block_bitmap, p[i], BLOCK_BITMAP_SECTOR_NUM);
+        if (nblocks <= MAX_INDIRECT_NUM)
+        {
+            clear_bitmap(block_bitmap, inode->indirect_table, BLOCK_BITMAP_SECTOR_NUM);
+            inode->indirect_table = -1;
+        }
+    }
+    inode->size = new_size;
+    pthread_mutex_unlock(&inode_table[ino].lock);
+
     return;
 }
 
@@ -550,6 +565,10 @@ int p6fs_mkdir(const char *path, mode_t mode)
     memcpy(buf, default_entries, sizeof(default_entries));
     device_write_sector(buf, DATABLOCK_SECTOR_NUM + dentry_blkn);
     device_flush();
+    pthread_mutex_lock(&fs_superblock.lock);
+    --fs_superblock.sb->free_block_cnt;
+    --fs_superblock.sb->free_inode_cnt;
+    pthread_mutex_unlock(&fs_superblock.lock);
     DEBUG("Created new directory with i-node %d, dentry blk #%d", ino, dentry_blkn)
 
     return 0;
@@ -718,6 +737,9 @@ int p6fs_mknod(const char *path, mode_t mode, dev_t dev)
     dp->ino = ino;
     device_write_sector(buf, parent_blk);
     device_flush();
+    pthread_mutex_lock(&fs_superblock.lock);
+    --fs_superblock.sb->free_inode_cnt;
+    pthread_mutex_unlock(&fs_superblock.lock);
     DEBUG("Created new file node with i-node %d", ino)
 
     return 0;
@@ -840,6 +862,10 @@ int p6fs_symlink(const char *path, const char *link)
         strcpy((char *)buf, path);
         device_write_sector(buf, inode->block[0]);
         device_flush();
+        pthread_mutex_lock(&fs_superblock.lock);
+        --fs_superblock.sb->free_block_cnt;
+        --fs_superblock.sb->free_inode_cnt;
+        pthread_mutex_unlock(&fs_superblock.lock);
         DEBUG("Created symlink with i-node %d: %s -> %s", ino, link, path)
     }
 
@@ -904,7 +930,7 @@ int p6fs_unlink(const char *path)
         return -EISDIR;
 
     // delete dentry
-    char *last = strrchr(path, '/');
+    char *last = strrchr(path, '/') + 1;
     unsigned char buf[SECTOR_SIZE];
     int parent_blk = dentry_from_path(path);
     parent_blk = inode_table[dentry_from_path(path)].inode->block[0];
@@ -920,6 +946,8 @@ int p6fs_unlink(const char *path)
             break;
         }
     }
+    device_write_sector(buf, parent_blk);
+    device_flush();
     // free inode
     // hard links are not distinguishable
     pthread_mutex_lock(&inode_table[ino].lock);
@@ -1053,7 +1081,6 @@ int p6fs_truncate(const char *path, off_t newSize)
         if ((ret = alloc_blocks(ino, newSize)) == -1)
             return -ENOSPC;
     }
-    inode->size = newSize;
     flush_inode(ino);
 
     return 0;

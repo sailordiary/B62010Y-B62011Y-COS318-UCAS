@@ -71,7 +71,7 @@ void flush_superblock()
 }
 
 // mount an existing filesystem
-void mountp6fs(struct superblock_t *sblock)
+void mountp6fs(struct superblock_t *sblock, int flag)
 {
 	DEBUG("Mounting P6FS...")
     // initialize in-memory structure
@@ -96,7 +96,8 @@ void mountp6fs(struct superblock_t *sblock)
     }
 
     // deserialize superblock
-    memcpy(fs_superblock.sb, sblock, sizeof(struct superblock_t));
+    if (!flag)
+        memcpy(fs_superblock.sb, sblock, sizeof(struct superblock_t));
     // deserialize bitmap and inode table
     unsigned char buf[SECTOR_SIZE], *dst_c = (unsigned char *)block_bitmap;
     for (i = BLOCK_BITMAP_SECTOR_NUM; i < INODE_BITMAP_SECTOR_NUM; ++i)
@@ -120,6 +121,33 @@ void mountp6fs(struct superblock_t *sblock)
         device_read_sector(buf, i);
         memcpy(dst_ino, buf, sizeof(struct inode_t));
         dst_ino++;
+    }
+
+    if (flag)
+    {
+        // rebuild superblock
+        sblock->magic_number = P6FS_MAGIC;
+        sblock->size = PARTITION_SIZE;
+        sblock->total_block_cnt = TOTAL_BLOCKS;
+        sblock->total_inode_cnt = MAX_INODE;
+        sblock->free_block_cnt = TOTAL_BLOCKS;
+        sblock->free_inode_cnt = MAX_INODE;
+        for (i = 0; i = MAX_INODE; ++i)
+            if (test_bit(inode_bitmap, i))
+                --sblock->free_inode_cnt;
+        for (i = 0; i = TOTAL_BLOCKS; ++i)
+            if (test_bit(block_bitmap, i))
+                --sblock->free_block_cnt;
+        sblock->block_map = SECTOR_SIZE * BLOCK_BITMAP_SECTOR_NUM;
+        sblock->inode_table = SECTOR_SIZE * INODE_TABLE_SECTOR_NUM;
+        sblock->inode_map = SECTOR_SIZE * INODE_BITMAP_SECTOR_NUM;
+        memcpy(fs_superblock.sb, sblock, sizeof(struct superblock_t));
+        // write new superblock to device
+        memcpy(buf, sblock, sizeof(struct superblock_t));
+        device_write_sector(buf, SUPERBLOCK_SECTOR_NUM);
+        device_flush();
+        device_write_sector(buf, SUPERBLOCK_BK_SECTOR_NUM);
+        device_flush();
     }
 
     // initialize file descriptor table
@@ -181,7 +209,7 @@ void mkp6fs()
     device_write_sector(buf, DATABLOCK_SECTOR_NUM);
     device_flush();
 
-    mountp6fs(&sblock);
+    mountp6fs(&sblock, 0);
     // allocate root inode
     struct fuse_context *fuse_con = fuse_get_context();
     uid_t uid = fuse_con->uid;
@@ -1394,7 +1422,7 @@ void *p6fs_init(struct fuse_conn_info *conn)
     memcpy(&sblock_buf, buf, sizeof(struct superblock_t));
 
     // check if there is an existing filesystem
-    int exist = 0;
+    int exist = 0, rebuild_flag = 0;
     if (sblock_buf.magic_number == P6FS_MAGIC)
     {
         exist = 1;
@@ -1408,9 +1436,12 @@ void *p6fs_init(struct fuse_conn_info *conn)
         DEBUG("Superblock #2 MD5: %s", md5_backup)
         if (!strcmp(md5_orig, md5_backup))
             INFO("Checksum test passed")
-        else
+        else {
             ERR("Checksum test failed, rebuilding superblock")
-            // TODO: rebuild superblock
+            rebuild_flag = 1;
+            // TODO: rebuild superblock from bitmap info
+        }
+           
     }
     else
     {
@@ -1427,7 +1458,7 @@ void *p6fs_init(struct fuse_conn_info *conn)
     }
 
     if (exist)
-        mountp6fs(&sblock_buf);
+        mountp6fs(&sblock_buf, rebuild_flag);
     else
     {
         INFO("Creating filesystem on %s", DISK_ROOT)

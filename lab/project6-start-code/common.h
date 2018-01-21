@@ -75,7 +75,7 @@ struct inode_t{
     int block[MAX_DIRECT_NUM];      // direct blocks
     int indirect_table;             // indirect blocks
 
-    time_t ctime;                   // creation time
+    time_t ctime;                   // change time
     time_t atime;                   // access time
     time_t mtime;                   // modification time
 

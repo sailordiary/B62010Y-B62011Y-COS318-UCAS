@@ -430,7 +430,7 @@ void write_blocks(int ino, const char *buf, off_t offset, size_t size)
     return;
 }
 
-// precondition: size of ino > new_size
+// precondition: size of ino > new_size; ino locked
 void recycle_blocks(int ino, int new_size)
 {
     struct inode_t *inode = inode_table[ino].inode;
@@ -443,7 +443,7 @@ void recycle_blocks(int ino, int new_size)
         return;
     // starting with the first indirect block to recycle
     // no need to lock block bitmap since we are releasing the resources
-    pthread_mutex_lock(&inode_table[ino].lock);
+    pthread_mutex_lock(&fs_superblock.lock);
     int i;
     for (i = nblocks; i < MAX_INDIRECT_NUM; ++i) {
         clear_bitmap(block_bitmap, inode->block[i], BLOCK_BITMAP_SECTOR_NUM);
@@ -467,7 +467,10 @@ void recycle_blocks(int ino, int new_size)
         }
     }
     inode->size = new_size;
-    pthread_mutex_unlock(&inode_table[ino].lock);
+    flush_inode(ino);
+    fs_superblock.sb->free_block_cnt += (nblocks_old - nblocks);
+    flush_superblock();
+    pthread_mutex_unlock(&fs_superblock.lock);
 
     return;
 }
@@ -1076,17 +1079,18 @@ int p6fs_unlink(const char *path)
     // free inode
     // hard links are not distinguishable
     pthread_mutex_lock(&inode_table[ino].lock);
-    pthread_mutex_lock(&fs_superblock.lock);
     pthread_mutex_lock(&inode_bitmap_lock);
     if (--inode->link_count == 0) {
+        DEBUG("Completely removing file %s", path)
         clear_bitmap(inode_bitmap, ino, INODE_BITMAP_SECTOR_NUM);
+        pthread_mutex_lock(&fs_superblock.lock);
         ++fs_superblock.sb->free_inode_cnt;
         flush_superblock();
+        pthread_mutex_unlock(&fs_superblock.lock);
         recycle_blocks(ino, 0);
     }
     flush_inode(ino);
     pthread_mutex_unlock(&inode_bitmap_lock);
-    pthread_mutex_unlock(&fs_superblock.lock);
     pthread_mutex_unlock(&inode_table[ino].lock);
 
     return 0;
@@ -1212,8 +1216,11 @@ int p6fs_truncate(const char *path, off_t newSize)
     struct inode_t *inode = inode_table[ino].inode;
     if (inode->size == newSize)
         return 0;
-    else if (inode->size > newSize)
+    else if (inode->size > newSize) {
+        pthread_mutex_lock(&inode_table[ino].lock);
         recycle_blocks(ino, newSize);
+        pthread_mutex_unlock(&inode_table[ino].lock);
+    }
     else
     {
         int ret;
@@ -1439,7 +1446,6 @@ void *p6fs_init(struct fuse_conn_info *conn)
         else {
             ERR("Checksum test failed, rebuilding superblock")
             rebuild_flag = 1;
-            // TODO: rebuild superblock from bitmap info
         }
            
     }

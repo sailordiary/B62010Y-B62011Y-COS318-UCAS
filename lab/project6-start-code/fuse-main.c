@@ -6,7 +6,7 @@
 
 
 static struct fuse_operations p6fs_ops = {    
-     //task1 interfaces
+     // Task1 interfaces
      .mkdir = p6fs_mkdir,
      .rmdir = p6fs_rmdir,
      .readdir = p6fs_readdir,
@@ -25,21 +25,21 @@ static struct fuse_operations p6fs_ops = {
      .rename = p6fs_rename,
      .statfs = p6fs_statfs,
      .init = p6fs_init,
-     /*
-     //task2 bonus interfaces
-     .utime = ,
-     .readlink = ,
-     .chmod = ,
-     .destroy = ,
+     
+     // Task2 bonus interfaces
+     .utime = p6fs_utime,
+     .readlink = p6fs_readlink,
+     .chmod = p6fs_chmod,
+     .destroy = p6fs_destroy,
      
      //optional interfaces
-     .opendir = ,
+     /*.opendir = ,
      .releasedir = ,
      .fsyncdir = ,
      .flush = ,
      .fsync = ,
-     .chown = ,
      */
+     .chown = p6fs_chown,
 };
 
 static struct p6fs_device {
